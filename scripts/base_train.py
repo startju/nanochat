@@ -82,7 +82,7 @@ parser.add_argument("--eval-tokens", type=int, default=80*524288, help="number o
 parser.add_argument("--core-metric-every", type=int, default=2000, help="evaluate CORE metric every N steps (-1 = disable)")
 parser.add_argument("--core-metric-max-per-task", type=int, default=500, help="examples per task for CORE metric")
 parser.add_argument("--sample-every", type=int, default=2000, help="sample from model every N steps (-1 = disable)")
-parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
+parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end, 0 = disable all saves)")
 parser.add_argument("--save-keep-last", type=int, default=-1, help="keep only the N most recent checkpoints (-1 = keep all). After each save, delete older model_*.pt / meta_*.json / optim_*.pt sets beyond the N newest by step.")
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
@@ -514,7 +514,16 @@ while True:
         model.train()
 
     # save checkpoint: at the end of the run, or every save_every steps, except at the first step or the resume step
-    if last_step or (step > 0 and step != args.resume_from_step and args.save_every > 0 and step % args.save_every == 0):
+    should_save_checkpoint = args.save_every != 0 and (
+        last_step
+        or (
+            step > 0
+            and step != args.resume_from_step
+            and args.save_every > 0
+            and step % args.save_every == 0
+        )
+    )
+    if should_save_checkpoint:
         save_checkpoint(
             checkpoint_dir,
             step,
