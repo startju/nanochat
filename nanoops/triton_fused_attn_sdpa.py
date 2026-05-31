@@ -55,7 +55,7 @@ def _pick_attn_sdpa_dq_tile_config(
     monkeypatch these constants/functions before `torch.compile`.
     """
     if head_dim >= 128:
-        return 32, 32, 4, 1
+        return 32, 64, 4, 1
     return 64, 64, 4, 1
 
 
@@ -64,7 +64,7 @@ def _pick_attn_sdpa_dkv_tile_config(
 ) -> tuple[int, int, int, int]:
     """Return `(block_m, block_n, num_warps, num_stages)` for dKV."""
     if head_dim >= 128:
-        return 32, 32, 4, 1
+        return 32, 64, 4, 1
     return 64, 64, 4, 1
 
 

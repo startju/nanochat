@@ -45,7 +45,7 @@ except ImportError:
 # ─────────────────────────────────────────────────────────────────────
 
 if _HAS_TRITON:
-    _ATTN_OUTPUT_PROJ_FWD_BLOCK_M = 64
+    _ATTN_OUTPUT_PROJ_FWD_BLOCK_M = 128
     _ATTN_OUTPUT_PROJ_FWD_BLOCK_DOUT = 128
     _ATTN_OUTPUT_PROJ_FWD_BLOCK_DIN = 32
     _ATTN_OUTPUT_PROJ_FWD_NUM_WARPS = 8
