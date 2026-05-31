@@ -444,11 +444,11 @@ def _apply() -> dict[str, dict]:
             gpt_mod.Block.forward
         )
         gpt_mod.Block.forward = _patched_block_forward
-    # Fused attention QKV: opt-in via NANOOPS_FUSED_ATTN_QKV=1. This is
+    # Fused attention: opt-in via NANOOPS_FUSED_ATTN=1. This is
     # installed at GPT.forward instead of CausalSelfAttention.forward because
     # the fused op owns the outer RMSNorm that nanchat applies one level up in
     # Block.forward, and it needs token ids + VE table to fuse value embedding.
-    if os.environ.get("NANOOPS_FUSED_ATTN_QKV"):
+    if os.environ.get("NANOOPS_FUSED_ATTN"):
         from .triton_fused_attn_output import attn_output_proj_residual as _tail
         from .triton_fused_attn_qkv import norm_qkv_projection_with_residual_mix as _nqp
 
@@ -544,7 +544,7 @@ def patch_nanchat() -> list[str]:
         names.append("CausalSelfAttention.forward(L-only activation checkpoint)")
     if os.environ.get("NANOOPS_FUSED_MLP"):
         names.append("Block.forward(fused_mlp — supersedes relu_square fusion)")
-    if os.environ.get("NANOOPS_FUSED_ATTN_QKV"):
+    if os.environ.get("NANOOPS_FUSED_ATTN"):
         names.append("GPT.forward(norm_qkv_projection + attn_output_proj_residual fused)")
     return names
 

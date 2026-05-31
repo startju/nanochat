@@ -7,8 +7,7 @@
 #
 # Usage:
 #   bash nanoops/train.sh                       # defaults below
-#   bash nanoops/train.sh fuse                  # full fuse, no activation checkpoints
-#   NANOOPS_TRAIN_PATH=fuse bash nanoops/train.sh
+#   NANOOPS_FUSED=1 bash nanoops/train.sh       # full fuse, no activation checkpoints
 #   bash nanoops/train.sh --num-iterations=10   # pass extra args through
 #   NPROC=4 bash nanoops/train.sh               # override GPU count
 #   WANDB_RUN=myrun bash nanoops/train.sh       # enable wandb logging
@@ -27,11 +26,7 @@ export NANOCHAT_BASE_DIR="${NANOCHAT_BASE_DIR:-$HOME/.cache/nanochat}"
 # scripts/base_train.py (line 15) before any CUDA call, so we don't
 # re-export it here.
 
-TRAIN_PATH=${NANOOPS_TRAIN_PATH:-default}
-if [ "${1:-}" = "default" ] || [ "${1:-}" = "fuse" ]; then
-    TRAIN_PATH=$1
-    shift
-fi
+NANOOPS_FUSED=${NANOOPS_FUSED:-}
 
 # Optimizer CPU offload ON by default — moves DistMuonAdamW's per-rank
 # Muon + AdamW state (~2.5 GB + ~300 MB on d24 under ZeRO-1) to CPU
@@ -42,32 +37,30 @@ fi
 # pattern). Opt out with empty value.
 export NANOOPS_OFFLOAD_OPTIM="${NANOOPS_OFFLOAD_OPTIM:-1}"
 
-case "$TRAIN_PATH" in
-    default)
-        # Checkpoint-heavy d24 path. This keeps the historical defaults:
-        # fused kernels are enabled, and activation checkpointing is on to
-        # maximize memory headroom on 24 GiB cards.
-        export NANOOPS_MLP_CHECKPOINT="${NANOOPS_MLP_CHECKPOINT:-1}"
-        export NANOOPS_L_ATTN_CHECKPOINT="${NANOOPS_L_ATTN_CHECKPOINT:-1}"
-        export NANOOPS_FUSED_MLP="${NANOOPS_FUSED_MLP:-1}"
-        export NANOOPS_FUSED_ATTN_QKV="${NANOOPS_FUSED_ATTN_QKV-1}"
-        SAVE_EVERY=${NANOOPS_SAVE_EVERY:-50}
-        ;;
-    fuse)
-        # Full-fuse d24 path for performance runs: use fused MLP + fused QKV
-        # + fused SDPA/output tail, but do not activation-checkpoint MLP or
-        # full-attention layers.
-        export NANOOPS_MLP_CHECKPOINT=
-        export NANOOPS_L_ATTN_CHECKPOINT=
-        export NANOOPS_FUSED_MLP=1
-        export NANOOPS_FUSED_ATTN_QKV=1
-        SAVE_EVERY=${NANOOPS_SAVE_EVERY:-200}
-        ;;
-    *)
-        echo "Unknown NANOOPS_TRAIN_PATH='$TRAIN_PATH' (expected 'default' or 'fuse')" >&2
-        exit 2
-        ;;
-esac
+if [ -n "$NANOOPS_FUSED" ]; then
+    # Full-fuse d24 path for performance runs: use fused MLP + fused QKV
+    # + fused SDPA/output tail, but do not activation-checkpoint MLP or
+    # full-attention layers.
+    #
+    # Current d24 + B=1 + 2x RTX 3090 run, after compile/eval warmup:
+    #   dt        ~55.8 s/step
+    #   tok/sec   ~18,800
+    #   MFU       ~63%
+    # First step is slower (~125 s) because it includes validation and compile.
+    export NANOOPS_MLP_CHECKPOINT=
+    export NANOOPS_L_ATTN_CHECKPOINT=
+    export NANOOPS_FUSED_MLP=1
+    export NANOOPS_FUSED_ATTN=1
+else
+    # Checkpoint-heavy d24 path. This keeps the historical defaults:
+    # fused kernels are enabled, and activation checkpointing is on to
+    # maximize memory headroom on 24 GiB cards.
+    export NANOOPS_MLP_CHECKPOINT="${NANOOPS_MLP_CHECKPOINT:-1}"
+    export NANOOPS_L_ATTN_CHECKPOINT="${NANOOPS_L_ATTN_CHECKPOINT:-1}"
+    export NANOOPS_FUSED_MLP="${NANOOPS_FUSED_MLP:-1}"
+    export NANOOPS_FUSED_ATTN="${NANOOPS_FUSED_ATTN-1}"
+fi
+SAVE_EVERY=${NANOOPS_SAVE_EVERY:-200}
 
 NPROC=${NPROC:-2}
 WANDB_RUN=${WANDB_RUN:-dummy}
@@ -83,7 +76,7 @@ BASE_TRAIN_ARGS=(
     --run="$WANDB_RUN"
 )
 
-echo "nanoops train path: $TRAIN_PATH (NPROC=$NPROC, save_every=$SAVE_EVERY, run=$WANDB_RUN)"
+echo "nanoops fused: ${NANOOPS_FUSED:-0} (NPROC=$NPROC, save_every=$SAVE_EVERY, run=$WANDB_RUN)"
 
 # NPROC=1: launch via plain python (NOT torchrun). torchrun unconditionally
 # sets RANK / LOCAL_RANK / WORLD_SIZE in env, which makes nanchat's
@@ -111,7 +104,7 @@ fi
 # expandable_segments + MLP_CHECKPOINT) only B=1 fits — B=2 OOMs by ~20 MiB,
 # B=4 OOMs by ~1 GiB.
 #
-# Measured numbers at d24 + B=1:
+# Historical checkpoint-heavy numbers at d24 + B=1:
 #   tok/sec  ~15,800
 #   MFU       ~53% (B=1 micro-batches don't saturate GEMMs)
 #   dt        ~66.5 s/iter (256 grad-accum steps × 270 ms)
