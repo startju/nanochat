@@ -199,7 +199,7 @@ nanchat d24 训练时各 matmul (M=2048, K=1536, N 不同)：
 流量，但算力收益接近 0。把 norm fuse 进邻接的 matmul kernel
 （mlp 走 `fused_mlp`）能让归一化的中间值留在 register 里，
 **省下 4·M·D 字节 HBM 流量**（norm 输出写回 + matmul 输入再读）——带宽
-bound 的 op 上**纯赚**。attn 侧 `norm_qkv_projection` 目前先用共享
+bound 的 op 上**纯赚**。attn 侧 `fused_attn_qkv_projection` 目前先用共享
 RMSNorm kernel 物化 `x_hat`，再做 Q/K/V projection；这个版本在 d24
 bench 里略快。
 
@@ -349,7 +349,7 @@ naive 的比值不变。
 
 本 repo 里最简单的 fused kernel。**纯学习用**——nanchat 生产 block
 里 RMSNorm 已经直接 fold 进相邻的 matmul kernel（attn 走
-`norm_qkv_projection`，mlp 走 `fused_mlp`），所以根本不存在
+`fused_attn_qkv_projection`，mlp 走 `fused_mlp`），所以根本不存在
 独立的 `add → norm` op 边界让这个 kernel 上 hot path。但这个 kernel
 用到的每一个 pattern 都是更大 fused kernel 的基石，所以它是学这些
 patterns 最干净的样本。
@@ -846,7 +846,7 @@ framework overhead 的地方。
 
 这也是为什么 nanchat 生产路径大多跳过这个 standalone op-boundary
 kernel：`fused_mlp` 把 norm 直接 fold 进自己的 matmul 路径；
-`norm_qkv_projection` 只复用其中的 RMSNorm 物化子 kernel，然后接
+`fused_attn_qkv_projection` 只复用其中的 RMSNorm 物化子 kernel，然后接
 Q/K/V projection。真正让 patterns 体现价值的，是更大的生产 kernel。
 
 ---

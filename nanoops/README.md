@@ -85,7 +85,7 @@ adds optional fast-path variants.
       across the matmul); c_proj uses cuBLAS. Backward chains the two
       cuBLAS gradients with a small relu²-bwd Triton kernel and an
       RMSNorm-bwd Triton kernel.
-- [x] **`norm_qkv_projection`**: `RMSNorm(x) @ W_qkv.T` where W_qkv is
+- [x] **`fused_attn_qkv_projection`**: `RMSNorm(x) @ W_qkv.T` where W_qkv is
       `concat([c_q.weight, c_k.weight, c_v.weight])`, with Q/K rotary,
       QK RMSNorm, and scale applied before writeback. This covers the
       QKV-side setup before SDPA.

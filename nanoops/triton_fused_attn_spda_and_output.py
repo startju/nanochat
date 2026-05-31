@@ -1,6 +1,6 @@
 """Attention output-side Triton kernels for nanoops.
 
-Public entry: `attn_output_proj_residual`, the fused training attention tail:
+Public entry: `fused_attn_spda_and_output`, the fused training attention tail:
 
     attn_out = sdpa(q, k, v)
     y        = residual + attn_out @ proj_weight.T
@@ -45,26 +45,26 @@ except ImportError:
 # ─────────────────────────────────────────────────────────────────────
 
 if _HAS_TRITON:
-    _ATTN_OUTPUT_PROJ_FWD_BLOCK_M = 128
-    _ATTN_OUTPUT_PROJ_FWD_BLOCK_DOUT = 128
-    _ATTN_OUTPUT_PROJ_FWD_BLOCK_DIN = 32
-    _ATTN_OUTPUT_PROJ_FWD_NUM_WARPS = 8
-    _ATTN_OUTPUT_PROJ_FWD_NUM_STAGES = 3
+    _FUSED_ATTN_SPDA_AND_OUTPUT_PROJ_FWD_BLOCK_M = 128
+    _FUSED_ATTN_SPDA_AND_OUTPUT_PROJ_FWD_BLOCK_DOUT = 128
+    _FUSED_ATTN_SPDA_AND_OUTPUT_PROJ_FWD_BLOCK_DIN = 32
+    _FUSED_ATTN_SPDA_AND_OUTPUT_PROJ_FWD_NUM_WARPS = 8
+    _FUSED_ATTN_SPDA_AND_OUTPUT_PROJ_FWD_NUM_STAGES = 3
 
-    _ATTN_OUTPUT_PROJ_DATTN_BLOCK_M = 64
-    _ATTN_OUTPUT_PROJ_DATTN_BLOCK_DOUT = 32
-    _ATTN_OUTPUT_PROJ_DATTN_BLOCK_DIN = 128
-    _ATTN_OUTPUT_PROJ_DATTN_NUM_WARPS = 8
-    _ATTN_OUTPUT_PROJ_DATTN_NUM_STAGES = 3
+    _FUSED_ATTN_SPDA_AND_OUTPUT_PROJ_DATTN_BLOCK_M = 64
+    _FUSED_ATTN_SPDA_AND_OUTPUT_PROJ_DATTN_BLOCK_DOUT = 32
+    _FUSED_ATTN_SPDA_AND_OUTPUT_PROJ_DATTN_BLOCK_DIN = 128
+    _FUSED_ATTN_SPDA_AND_OUTPUT_PROJ_DATTN_NUM_WARPS = 8
+    _FUSED_ATTN_SPDA_AND_OUTPUT_PROJ_DATTN_NUM_STAGES = 3
 
-    _ATTN_OUTPUT_PROJ_DWEIGHT_BLOCK_M = 64
-    _ATTN_OUTPUT_PROJ_DWEIGHT_BLOCK_DOUT = 128
-    _ATTN_OUTPUT_PROJ_DWEIGHT_BLOCK_DIN = 64
-    _ATTN_OUTPUT_PROJ_DWEIGHT_NUM_WARPS = 8
-    _ATTN_OUTPUT_PROJ_DWEIGHT_NUM_STAGES = 1
+    _FUSED_ATTN_SPDA_AND_OUTPUT_PROJ_DWEIGHT_BLOCK_M = 64
+    _FUSED_ATTN_SPDA_AND_OUTPUT_PROJ_DWEIGHT_BLOCK_DOUT = 128
+    _FUSED_ATTN_SPDA_AND_OUTPUT_PROJ_DWEIGHT_BLOCK_DIN = 64
+    _FUSED_ATTN_SPDA_AND_OUTPUT_PROJ_DWEIGHT_NUM_WARPS = 8
+    _FUSED_ATTN_SPDA_AND_OUTPUT_PROJ_DWEIGHT_NUM_STAGES = 1
 
     @triton.jit
-    def _attn_output_proj_fwd_kernel(
+    def _fused_attn_spda_and_output_proj_fwd_kernel(
         attn_out_ptr,  # (M, D_in), activation dtype — in: attention output
         proj_w_ptr,  # (D_out, D_in), weight dtype — in: output projection weight
         residual_ptr,  # (M, D_out), activation dtype — in: residual stream
@@ -119,7 +119,7 @@ if _HAS_TRITON:
         tl.store(y_ptrs, y, mask=out_mask)
 
     @triton.jit
-    def _attn_output_proj_dattn_delta_bwd_kernel(
+    def _fused_attn_spda_and_output_proj_dattn_delta_bwd_kernel(
         attn_out_ptr,  # (M, H_Q*D_HEAD), activation dtype — in: SDPA output
         proj_w_ptr,  # (D_out, H_Q*D_HEAD), weight dtype — in
         dy_ptr,  # (M, D_out), activation dtype — in
@@ -180,7 +180,7 @@ if _HAS_TRITON:
         tl.store(delta_ptr + rows * H_Q + hid, delta, mask=row_mask & head_mask)
 
     @triton.jit
-    def _attn_output_proj_dweight_bwd_kernel(
+    def _fused_attn_spda_and_output_proj_dweight_bwd_kernel(
         attn_out_ptr,  # (M, D_in), activation dtype — in: forward attention output
         dy_ptr,  # (M, D_out), activation dtype — in: output gradient
         d_proj_w_ptr,  # (D_out, D_in), proj_weight dtype — out
@@ -222,129 +222,7 @@ if _HAS_TRITON:
         )
 
 
-def _attn_output_proj_fwd_impl(
-    attn_out: torch.Tensor,
-    proj_weight: torch.Tensor,
-    residual: torch.Tensor,
-) -> torch.Tensor:
-    """Launch the attention-output projection forward kernel.
-
-    Args:
-      attn_out: `(M, D_in)` contiguous CUDA tensor, activation dtype.
-      proj_weight: `(D_out, D_in)` contiguous CUDA tensor, weight dtype.
-      residual: `(M, D_out)` contiguous CUDA tensor, activation dtype.
-
-    Returns:
-      `y`: `(M, D_out)` tensor, dtype=`attn_out.dtype`.
-    """
-    if not _HAS_TRITON:
-        raise RuntimeError("attn_output_proj_residual requires triton")
-    assert attn_out.is_cuda and proj_weight.is_cuda and residual.is_cuda
-    assert attn_out.is_contiguous() and proj_weight.is_contiguous() and residual.is_contiguous()
-    assert attn_out.ndim == proj_weight.ndim == residual.ndim == 2
-    M, D_in = attn_out.shape
-    M_res, D_out = residual.shape
-    D_out_w, D_in_w = proj_weight.shape
-    assert M == M_res and D_in == D_in_w and D_out == D_out_w
-
-    y = torch.empty((M, D_out), dtype=attn_out.dtype, device=attn_out.device)
-    BLOCK_M = _ATTN_OUTPUT_PROJ_FWD_BLOCK_M
-    BLOCK_DOUT = _ATTN_OUTPUT_PROJ_FWD_BLOCK_DOUT
-    BLOCK_DIN = _ATTN_OUTPUT_PROJ_FWD_BLOCK_DIN
-    grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(D_out, BLOCK_DOUT))
-    wrap_triton(_attn_output_proj_fwd_kernel)[grid](
-        attn_out,
-        proj_weight,
-        residual,
-        y,
-        M,
-        D_out,
-        D_in,
-        BLOCK_M=BLOCK_M,
-        BLOCK_DOUT=BLOCK_DOUT,
-        BLOCK_DIN=BLOCK_DIN,
-        num_warps=_ATTN_OUTPUT_PROJ_FWD_NUM_WARPS,
-        num_stages=_ATTN_OUTPUT_PROJ_FWD_NUM_STAGES,
-    )
-    return y
-
-
-def _attn_output_proj_dattn_delta_bwd_impl(
-    dy: torch.Tensor,
-    attn_out: torch.Tensor,
-    proj_weight: torch.Tensor,
-    n_head: int,
-    head_dim: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Backward for output projection, also producing SDPA `delta`.
-
-    Args:
-      dy: `(M, D_out)` output gradient.
-      attn_out: `(M, n_head * head_dim)` saved SDPA output.
-      proj_weight: `(D_out, n_head * head_dim)` projection weight.
-      n_head: number of attention output heads.
-      head_dim: per-head width.
-
-    Returns:
-      d_attn_out: `(M, n_head * head_dim)`.
-      d_proj_weight: `(D_out, n_head * head_dim)`.
-      delta: `(M, n_head)` fp32, where `delta[m, h] = dot(attn_out, d_attn_out)`.
-    """
-    if not _HAS_TRITON:
-        raise RuntimeError("attn_output_proj_residual backward requires triton")
-    dy = dy.contiguous()
-    assert dy.is_cuda and attn_out.is_cuda and proj_weight.is_cuda
-    assert dy.is_contiguous() and attn_out.is_contiguous() and proj_weight.is_contiguous()
-    assert dy.ndim == attn_out.ndim == proj_weight.ndim == 2
-    M, D_in = attn_out.shape
-    M_dy, D_out = dy.shape
-    D_out_w, D_in_w = proj_weight.shape
-    assert M == M_dy and D_in == D_in_w and D_out == D_out_w
-    assert D_in == n_head * head_dim
-
-    d_attn_out = torch.empty_like(attn_out)
-    delta = torch.empty((M, n_head), dtype=torch.float32, device=attn_out.device)
-    BLOCK_M = _ATTN_OUTPUT_PROJ_DATTN_BLOCK_M
-    BLOCK_DOUT = _ATTN_OUTPUT_PROJ_DATTN_BLOCK_DOUT
-    dattn_grid = (triton.cdiv(M, BLOCK_M), n_head)
-    wrap_triton(_attn_output_proj_dattn_delta_bwd_kernel)[dattn_grid](
-        attn_out,
-        proj_weight,
-        dy,
-        d_attn_out,
-        delta,
-        M,
-        n_head,
-        head_dim,
-        D_OUT=D_out,
-        BLOCK_M=BLOCK_M,
-        BLOCK_DOUT=BLOCK_DOUT,
-        num_warps=_ATTN_OUTPUT_PROJ_DATTN_NUM_WARPS,
-        num_stages=_ATTN_OUTPUT_PROJ_DATTN_NUM_STAGES,
-    )
-
-    d_proj_weight = torch.empty_like(proj_weight)
-    BLOCK_M = _ATTN_OUTPUT_PROJ_DWEIGHT_BLOCK_M
-    BLOCK_DOUT = _ATTN_OUTPUT_PROJ_DWEIGHT_BLOCK_DOUT
-    BLOCK_DIN = _ATTN_OUTPUT_PROJ_DWEIGHT_BLOCK_DIN
-    dweight_grid = (triton.cdiv(D_out, BLOCK_DOUT), triton.cdiv(D_in, BLOCK_DIN))
-    wrap_triton(_attn_output_proj_dweight_bwd_kernel)[dweight_grid](
-        attn_out,
-        dy,
-        d_proj_weight,
-        M,
-        D_out,
-        D_in,
-        BLOCK_M=BLOCK_M,
-        BLOCK_DOUT=BLOCK_DOUT,
-        BLOCK_DIN=BLOCK_DIN,
-        num_warps=_ATTN_OUTPUT_PROJ_DWEIGHT_NUM_WARPS,
-        num_stages=_ATTN_OUTPUT_PROJ_DWEIGHT_NUM_STAGES,
-    )
-    return d_attn_out, d_proj_weight, delta
-
-
-def _attn_output_proj_residual_fwd_impl(
+def _fused_attn_spda_and_output_fwd_impl(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -358,23 +236,45 @@ def _attn_output_proj_residual_fwd_impl(
     auxiliary tensors are saved so backward can fuse output-projection delta
     production with SDPA backward.
     """
-    from .triton_fused_attn_sdpa import _attn_sdpa_fwd_op
+    from .triton_fused_attn_spda import _fused_attn_spda_fwd_op
 
     assert q.ndim == k.ndim == v.ndim == 4
     assert residual.ndim == 3
     B, T, n_head, head_dim = q.shape
-    attn_out, lse = _attn_sdpa_fwd_op(q, k, v, window_size)
+    attn_out, lse = _fused_attn_spda_fwd_op(q, k, v, window_size)
     attn_flat = attn_out.contiguous().view(B * T, n_head * head_dim)
     residual_flat = residual.contiguous().view(B * T, -1)
-    y_flat = _attn_output_proj_fwd_impl(
+    assert attn_flat.is_cuda and proj_weight.is_cuda and residual_flat.is_cuda
+    assert attn_flat.is_contiguous() and proj_weight.is_contiguous()
+    assert residual_flat.is_contiguous()
+    M, d_in = attn_flat.shape
+    M_res, d_out = residual_flat.shape
+    d_out_w, d_in_w = proj_weight.shape
+    assert M == M_res and d_in == d_in_w and d_out == d_out_w
+
+    y_flat = torch.empty((M, d_out), dtype=attn_flat.dtype, device=attn_flat.device)
+    proj_block_m = _FUSED_ATTN_SPDA_AND_OUTPUT_PROJ_FWD_BLOCK_M
+    proj_block_dout = _FUSED_ATTN_SPDA_AND_OUTPUT_PROJ_FWD_BLOCK_DOUT
+    proj_block_din = _FUSED_ATTN_SPDA_AND_OUTPUT_PROJ_FWD_BLOCK_DIN
+    proj_grid = (triton.cdiv(M, proj_block_m), triton.cdiv(d_out, proj_block_dout))
+    wrap_triton(_fused_attn_spda_and_output_proj_fwd_kernel)[proj_grid](
         attn_flat,
         proj_weight,
         residual_flat,
+        y_flat,
+        M,
+        d_out,
+        d_in,
+        BLOCK_M=proj_block_m,
+        BLOCK_DOUT=proj_block_dout,
+        BLOCK_DIN=proj_block_din,
+        num_warps=_FUSED_ATTN_SPDA_AND_OUTPUT_PROJ_FWD_NUM_WARPS,
+        num_stages=_FUSED_ATTN_SPDA_AND_OUTPUT_PROJ_FWD_NUM_STAGES,
     )
     return y_flat.view(B, T, -1), attn_out, lse
 
 
-def _attn_output_proj_residual_bwd_impl(
+def _fused_attn_spda_and_output_bwd_impl(
     dy: torch.Tensor,
     q: torch.Tensor,
     k: torch.Tensor,
@@ -389,21 +289,65 @@ def _attn_output_proj_residual_bwd_impl(
     Returns gradients for `(q, k, v, proj_weight)`. The residual gradient is
     the direct `dy` passthrough and is returned by the autograd callback.
     """
-    from .triton_fused_attn_sdpa import _attn_sdpa_bwd_op
+    from .triton_fused_attn_spda import _fused_attn_spda_bwd_op
 
     B, T, n_head, head_dim = q.shape
     dy_flat = dy.contiguous().view(B * T, -1)
     attn_flat = attn_out.contiguous().view(B * T, n_head * head_dim)
-    d_attn_flat, d_proj_weight, delta_flat = _attn_output_proj_dattn_delta_bwd_impl(
-        dy_flat,
+    assert dy_flat.is_cuda and attn_flat.is_cuda and proj_weight.is_cuda
+    assert dy_flat.is_contiguous() and attn_flat.is_contiguous()
+    assert proj_weight.is_contiguous()
+    M, d_in = attn_flat.shape
+    M_dy, d_out = dy_flat.shape
+    d_out_w, d_in_w = proj_weight.shape
+    assert M == M_dy and d_in == d_in_w and d_out == d_out_w
+    assert d_in == n_head * head_dim
+
+    d_attn_flat = torch.empty_like(attn_flat)
+    delta_flat = torch.empty((M, n_head), dtype=torch.float32, device=attn_flat.device)
+    dattn_block_m = _FUSED_ATTN_SPDA_AND_OUTPUT_PROJ_DATTN_BLOCK_M
+    dattn_block_dout = _FUSED_ATTN_SPDA_AND_OUTPUT_PROJ_DATTN_BLOCK_DOUT
+    dattn_grid = (triton.cdiv(M, dattn_block_m), n_head)
+    wrap_triton(_fused_attn_spda_and_output_proj_dattn_delta_bwd_kernel)[dattn_grid](
         attn_flat,
         proj_weight,
+        dy_flat,
+        d_attn_flat,
+        delta_flat,
+        M,
         n_head,
         head_dim,
+        D_OUT=d_out,
+        BLOCK_M=dattn_block_m,
+        BLOCK_DOUT=dattn_block_dout,
+        num_warps=_FUSED_ATTN_SPDA_AND_OUTPUT_PROJ_DATTN_NUM_WARPS,
+        num_stages=_FUSED_ATTN_SPDA_AND_OUTPUT_PROJ_DATTN_NUM_STAGES,
+    )
+
+    d_proj_weight = torch.empty_like(proj_weight)
+    dweight_block_m = _FUSED_ATTN_SPDA_AND_OUTPUT_PROJ_DWEIGHT_BLOCK_M
+    dweight_block_dout = _FUSED_ATTN_SPDA_AND_OUTPUT_PROJ_DWEIGHT_BLOCK_DOUT
+    dweight_block_din = _FUSED_ATTN_SPDA_AND_OUTPUT_PROJ_DWEIGHT_BLOCK_DIN
+    dweight_grid = (
+        triton.cdiv(d_out, dweight_block_dout),
+        triton.cdiv(d_in, dweight_block_din),
+    )
+    wrap_triton(_fused_attn_spda_and_output_proj_dweight_bwd_kernel)[dweight_grid](
+        attn_flat,
+        dy_flat,
+        d_proj_weight,
+        M,
+        d_out,
+        d_in,
+        BLOCK_M=dweight_block_m,
+        BLOCK_DOUT=dweight_block_dout,
+        BLOCK_DIN=dweight_block_din,
+        num_warps=_FUSED_ATTN_SPDA_AND_OUTPUT_PROJ_DWEIGHT_NUM_WARPS,
+        num_stages=_FUSED_ATTN_SPDA_AND_OUTPUT_PROJ_DWEIGHT_NUM_STAGES,
     )
     d_attn = d_attn_flat.view(B, T, n_head, head_dim)
     delta = delta_flat.view(B, T, n_head)
-    dq, dk, dv = _attn_sdpa_bwd_op(
+    dq, dk, dv = _fused_attn_spda_bwd_op(
         d_attn,
         q,
         k,
@@ -419,10 +363,10 @@ def _attn_output_proj_residual_bwd_impl(
 
 
 @torch.library.triton_op(
-    "nanoops::attn_output_proj_residual_fwd",
+    "nanoops::fused_attn_spda_and_output_fwd",
     mutates_args=(),
 )
-def _attn_output_proj_residual_fwd_op(
+def _fused_attn_spda_and_output_fwd_op(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -431,7 +375,7 @@ def _attn_output_proj_residual_fwd_op(
     window_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Triton-op forward wrapper returning `(y, attn_out, lse)`."""
-    return _attn_output_proj_residual_fwd_impl(
+    return _fused_attn_spda_and_output_fwd_impl(
         q,
         k,
         v,
@@ -442,10 +386,10 @@ def _attn_output_proj_residual_fwd_op(
 
 
 @torch.library.triton_op(
-    "nanoops::attn_output_proj_residual_bwd",
+    "nanoops::fused_attn_spda_and_output_bwd",
     mutates_args=(),
 )
-def _attn_output_proj_residual_bwd_op(
+def _fused_attn_spda_and_output_bwd_op(
     dy: torch.Tensor,
     q: torch.Tensor,
     k: torch.Tensor,
@@ -456,7 +400,7 @@ def _attn_output_proj_residual_bwd_op(
     window_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Triton-op backward wrapper returning `(dq, dk, dv, dW)`."""
-    return _attn_output_proj_residual_bwd_impl(
+    return _fused_attn_spda_and_output_bwd_impl(
         dy,
         q,
         k,
@@ -468,7 +412,7 @@ def _attn_output_proj_residual_bwd_op(
     )
 
 
-def _attn_output_proj_residual_setup_context(
+def _fused_attn_spda_and_output_setup_context(
     ctx: Any,
     inputs: tuple[
         torch.Tensor,
@@ -487,7 +431,7 @@ def _attn_output_proj_residual_setup_context(
     ctx.window_size = window_size
 
 
-def _attn_output_proj_residual_autograd_backward(
+def _fused_attn_spda_and_output_autograd_backward(
     ctx: Any,
     dy: torch.Tensor,
     _d_attn_out_aux: torch.Tensor,
@@ -495,7 +439,7 @@ def _attn_output_proj_residual_autograd_backward(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, None]:
     """Backward for combined SDPA + output projection."""
     q, k, v, attn_out, lse, proj_weight = ctx.saved_tensors
-    dq, dk, dv, d_proj_weight = _attn_output_proj_residual_bwd_op(
+    dq, dk, dv, d_proj_weight = _fused_attn_spda_and_output_bwd_op(
         dy,
         q,
         k,
@@ -508,13 +452,13 @@ def _attn_output_proj_residual_autograd_backward(
     return dq, dk, dv, d_proj_weight, dy, None
 
 
-_attn_output_proj_residual_fwd_op.register_autograd(
-    _attn_output_proj_residual_autograd_backward,
-    setup_context=_attn_output_proj_residual_setup_context,
+_fused_attn_spda_and_output_fwd_op.register_autograd(
+    _fused_attn_spda_and_output_autograd_backward,
+    setup_context=_fused_attn_spda_and_output_setup_context,
 )
 
 
-def attn_output_proj_residual(
+def fused_attn_spda_and_output(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -543,7 +487,7 @@ def attn_output_proj_residual(
     v = v.contiguous()
     proj_weight = proj_weight.contiguous()
     residual = residual.contiguous()
-    y, _attn_out, _lse = _attn_output_proj_residual_fwd_op(
+    y, _attn_out, _lse = _fused_attn_spda_and_output_fwd_op(
         q,
         k,
         v,

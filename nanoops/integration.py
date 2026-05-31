@@ -449,8 +449,8 @@ def _apply() -> dict[str, dict]:
     # the fused op owns the outer RMSNorm that nanchat applies one level up in
     # Block.forward, and it needs token ids + VE table to fuse value embedding.
     if os.environ.get("NANOOPS_FUSED_ATTN"):
-        from .triton_fused_attn_output import attn_output_proj_residual as _tail
-        from .triton_fused_attn_qkv import norm_qkv_projection_with_residual_mix as _nqp
+        from .triton_fused_attn_spda_and_output import fused_attn_spda_and_output as _tail
+        from .triton_fused_attn_qkv import fused_attn_qkv_projection as _nqp
 
         assert _orig_gpt_forward is None, (
             "_orig_gpt_forward already captured — call _restore() before _apply()"
@@ -545,7 +545,7 @@ def patch_nanchat() -> list[str]:
     if os.environ.get("NANOOPS_FUSED_MLP"):
         names.append("Block.forward(fused_mlp — supersedes relu_square fusion)")
     if os.environ.get("NANOOPS_FUSED_ATTN"):
-        names.append("GPT.forward(norm_qkv_projection + attn_output_proj_residual fused)")
+        names.append("GPT.forward(fused_attn_qkv_projection + fused_attn_spda_and_output fused)")
     return names
 
 

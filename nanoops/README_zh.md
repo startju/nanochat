@@ -76,7 +76,7 @@ Tier 2 加入注意力；Tier 3 是可选的性能优化版本。
       c_fc + ReluSquare（per-row rms 在寄存器里跨 matmul 复用）；c_proj 走
       cuBLAS。Backward 串联两次 cuBLAS 梯度 + 一个小的 relu²-bwd Triton
       kernel + 一个 RMSNorm-bwd Triton kernel。
-- [x] **`norm_qkv_projection`**：`RMSNorm(x) @ W_qkv.T`，其中 W_qkv 是把
+- [x] **`fused_attn_qkv_projection`**：`RMSNorm(x) @ W_qkv.T`，其中 W_qkv 是把
       `c_q.weight, c_k.weight, c_v.weight` 在 dim 0 上拼接得到，并在写回前
       对 Q/K 做 rotary、QK RMSNorm 和 scale。它覆盖 SDPA 之前的 QKV-side
       setup。

@@ -10,20 +10,20 @@ if not torch.cuda.is_available():
     pytest.skip("triton kernels require CUDA", allow_module_level=True)
 
 from nanoops.triton_fused_attn_qkv import (
-    _norm_qkv_projection_with_residual_mix_fwd_op,
-    _norm_qkv_projection_with_residual_mix_bwd_impl,
-    norm_qkv_projection_with_residual_mix,
+    _fused_attn_qkv_projection_fwd_op,
+    _fused_attn_qkv_projection_bwd_impl,
+    fused_attn_qkv_projection as _fused_attn_qkv_projection,
 )
-from nanoops.triton_fused_attn_output import attn_output_proj_residual
+from nanoops.triton_fused_attn_spda_and_output import fused_attn_spda_and_output
 from nanoops.functional import sliding_window_sdpa
 
 
 # ─────────────────────────────────────────────────────────────────────
-# norm_qkv_projection:
+# fused_attn_qkv_projection:
 #   RMSNorm(x) @ W_qkv.T, with Q/K rotary + QK RMSNorm + scale fused before writeback
 # ─────────────────────────────────────────────────────────────────────
 
-def _norm_qkv_projection_ref(
+def _fused_attn_qkv_projection_ref(
     x,
     ve_ids,
     ve_weight,
@@ -83,7 +83,7 @@ def _norm_qkv_projection_ref(
     )
 
 
-def norm_qkv_projection(
+def fused_attn_qkv_projection_identity_mix(
     x,
     ve_ids,
     ve_weight,
@@ -104,7 +104,7 @@ def norm_qkv_projection(
     x0 = torch.zeros_like(x)
     resid_scale = torch.ones((), dtype=x.dtype, device=x.device)
     x0_scale = torch.zeros((), dtype=x.dtype, device=x.device)
-    q, k, v, _x_mix = norm_qkv_projection_with_residual_mix(
+    q, k, v, _x_mix = _fused_attn_qkv_projection(
         x,
         x0,
         resid_scale,
@@ -127,7 +127,7 @@ def norm_qkv_projection(
     return q, k, v
 
 
-def test_norm_qkv_projection_forward():
+def test_fused_attn_qkv_projection_forward():
     torch.manual_seed(0)
     B, T, K, n_head, n_kv_head, head_dim = 2, 16, 128, 4, 2, 128
     x = torch.randn(B, T, K, dtype=torch.float32, device="cuda")
@@ -137,7 +137,7 @@ def test_norm_qkv_projection_forward():
     cos = torch.randn(1, T, 1, head_dim // 2, dtype=torch.float32, device="cuda")
     sin = torch.randn(1, T, 1, head_dim // 2, dtype=torch.float32, device="cuda")
 
-    q_ref, k_ref, v_ref = _norm_qkv_projection_ref(
+    q_ref, k_ref, v_ref = _fused_attn_qkv_projection_ref(
         x,
         None,
         None,
@@ -154,7 +154,7 @@ def test_norm_qkv_projection_forward():
         1.2,
         1e-6,
     )
-    q_tri, k_tri, v_tri = norm_qkv_projection(
+    q_tri, k_tri, v_tri = fused_attn_qkv_projection_identity_mix(
         x,
         None,
         None,
@@ -181,7 +181,7 @@ def test_norm_qkv_projection_forward():
             f"{name} max diff {(ref - got).abs().max():.4e}"
 
 
-def test_norm_qkv_projection_broadcast_rotary_table():
+def test_fused_attn_qkv_projection_broadcast_rotary_table():
     torch.manual_seed(0)
     B, T, K, n_head, n_kv_head, head_dim = 2, 16, 128, 4, 2, 128
     M = B * T
@@ -192,7 +192,7 @@ def test_norm_qkv_projection_broadcast_rotary_table():
     cos = torch.randn(1, T, 1, head_dim // 2, dtype=torch.float32, device="cuda")
     sin = torch.randn(1, T, 1, head_dim // 2, dtype=torch.float32, device="cuda")
 
-    q_ref, k_ref, v_ref = _norm_qkv_projection_ref(
+    q_ref, k_ref, v_ref = _fused_attn_qkv_projection_ref(
         x,
         None,
         None,
@@ -209,7 +209,7 @@ def test_norm_qkv_projection_broadcast_rotary_table():
         1.2,
         1e-6,
     )
-    q_tri, k_tri, v_tri = norm_qkv_projection(
+    q_tri, k_tri, v_tri = fused_attn_qkv_projection_identity_mix(
         x,
         None,
         None,
@@ -236,7 +236,7 @@ def test_norm_qkv_projection_broadcast_rotary_table():
             f"{name} max diff {(ref - got).abs().max():.4e}"
 
 
-def test_norm_qkv_projection_value_embedding_lookup_forward_backward():
+def test_fused_attn_qkv_projection_value_embedding_lookup_forward_backward():
     torch.manual_seed(0)
     B, T, K, n_head, n_kv_head, head_dim = 2, 8, 128, 2, 1, 128
     vocab_size = 11
@@ -259,7 +259,7 @@ def test_norm_qkv_projection_value_embedding_lookup_forward_backward():
     x1, qw1, kw1, vw1, ve_w1, gw1 = (
         t.clone().requires_grad_() for t in (x0, qw0, kw0, vw0, ve_w0, gw0)
     )
-    q1, k1, v1 = _norm_qkv_projection_ref(
+    q1, k1, v1 = _fused_attn_qkv_projection_ref(
         x1,
         ve_ids,
         ve_w1,
@@ -281,7 +281,7 @@ def test_norm_qkv_projection_value_embedding_lookup_forward_backward():
     x2, qw2, kw2, vw2, ve_w2, gw2 = (
         t.clone().requires_grad_() for t in (x0, qw0, kw0, vw0, ve_w0, gw0)
     )
-    q2, k2, v2 = norm_qkv_projection(
+    q2, k2, v2 = fused_attn_qkv_projection_identity_mix(
         x2,
         ve_ids,
         ve_w2,
@@ -315,7 +315,7 @@ def test_norm_qkv_projection_value_embedding_lookup_forward_backward():
             f"{name} max diff {(ref - got).abs().max():.4e}"
 
 
-def test_norm_qkv_projection_backward():
+def test_fused_attn_qkv_projection_backward():
     torch.manual_seed(0)
     B, T, K, n_head, n_kv_head, head_dim = 2, 8, 128, 2, 1, 128
     x0 = torch.randn(B, T, K, dtype=torch.float32, device="cuda")
@@ -330,13 +330,13 @@ def test_norm_qkv_projection_backward():
     vg = torch.randn(B, T, n_kv_head, head_dim, dtype=torch.float32, device="cuda")
 
     x1, qw1, kw1, vw1 = (t.clone().requires_grad_() for t in (x0, qw0, kw0, vw0))
-    q1, k1, v1 = _norm_qkv_projection_ref(
+    q1, k1, v1 = _fused_attn_qkv_projection_ref(
         x1, None, None, 1, None, qw1, kw1, vw1, cos, sin, n_head, n_kv_head, head_dim, 1.2, 1e-6
     )
     torch.autograd.backward((q1, k1, v1), (qg, kg, vg))
 
     x2, qw2, kw2, vw2 = (t.clone().requires_grad_() for t in (x0, qw0, kw0, vw0))
-    q2, k2, v2 = norm_qkv_projection(
+    q2, k2, v2 = fused_attn_qkv_projection_identity_mix(
         x2, None, None, 1, None, qw2, kw2, vw2, cos, sin, n_head, n_kv_head, head_dim, 1.2, 1e-6
     )
     torch.autograd.backward((q2, k2, v2), (qg, kg, vg))
@@ -351,7 +351,7 @@ def test_norm_qkv_projection_backward():
             f"{name}.grad max diff {(ref - got).abs().max():.4e}"
 
 
-def test_norm_qkv_projection_backward_broadcast_rotary_table():
+def test_fused_attn_qkv_projection_backward_broadcast_rotary_table():
     torch.manual_seed(0)
     B, T, K, n_head, n_kv_head, head_dim = 2, 8, 128, 2, 1, 128
     M = B * T
@@ -367,13 +367,13 @@ def test_norm_qkv_projection_backward_broadcast_rotary_table():
     vg = torch.randn(B, T, n_kv_head, head_dim, dtype=torch.float32, device="cuda")
 
     x1, qw1, kw1, vw1 = (t.clone().requires_grad_() for t in (x0, qw0, kw0, vw0))
-    q1, k1, v1 = _norm_qkv_projection_ref(
+    q1, k1, v1 = _fused_attn_qkv_projection_ref(
         x1, None, None, 1, None, qw1, kw1, vw1, cos, sin, n_head, n_kv_head, head_dim, 1.2, 1e-6
     )
     torch.autograd.backward((q1, k1, v1), (qg, kg, vg))
 
     x2, qw2, kw2, vw2 = (t.clone().requires_grad_() for t in (x0, qw0, kw0, vw0))
-    q2, k2, v2 = norm_qkv_projection(
+    q2, k2, v2 = fused_attn_qkv_projection_identity_mix(
         x2, None, None, 1, None, qw2, kw2, vw2, cos, sin, n_head, n_kv_head, head_dim, 1.2, 1e-6
     )
     torch.autograd.backward((q2, k2, v2), (qg, kg, vg))
@@ -388,7 +388,7 @@ def test_norm_qkv_projection_backward_broadcast_rotary_table():
             f"{name}.grad max diff {(ref - got).abs().max():.4e}"
 
 
-def test_norm_qkv_projection_backward_bf16_smoke():
+def test_fused_attn_qkv_projection_backward_bf16_smoke():
     torch.manual_seed(0)
     B, T, K, n_head, n_kv_head, head_dim = 2, 8, 128, 2, 1, 128
     x = torch.randn(B, T, K, dtype=torch.bfloat16, device="cuda").requires_grad_()
@@ -404,7 +404,7 @@ def test_norm_qkv_projection_backward_bf16_smoke():
     cos = torch.randn(1, T, 1, head_dim // 2, dtype=torch.bfloat16, device="cuda")
     sin = torch.randn(1, T, 1, head_dim // 2, dtype=torch.bfloat16, device="cuda")
 
-    q, k, v = norm_qkv_projection(
+    q, k, v = fused_attn_qkv_projection_identity_mix(
         x,
         None,
         None,
@@ -432,7 +432,7 @@ def test_norm_qkv_projection_backward_bf16_smoke():
         assert torch.isfinite(grad.float()).all(), f"{name}.grad contains non-finite values"
 
 
-def test_norm_qkv_projection_head64_backward():
+def test_fused_attn_qkv_projection_head64_backward():
     torch.manual_seed(0)
     B, T, K, n_head, n_kv_head, head_dim = 2, 8, 128, 2, 1, 64
     x0 = torch.randn(B, T, K, dtype=torch.float32, device="cuda")
@@ -447,13 +447,13 @@ def test_norm_qkv_projection_head64_backward():
     vg = torch.randn(B, T, n_kv_head, head_dim, dtype=torch.float32, device="cuda")
 
     x1, qw1, kw1, vw1 = (t.clone().requires_grad_() for t in (x0, qw0, kw0, vw0))
-    q1, k1, v1 = _norm_qkv_projection_ref(
+    q1, k1, v1 = _fused_attn_qkv_projection_ref(
         x1, None, None, 1, None, qw1, kw1, vw1, cos, sin, n_head, n_kv_head, head_dim, 1.2, 1e-6
     )
     torch.autograd.backward((q1, k1, v1), (qg, kg, vg))
 
     x2, qw2, kw2, vw2 = (t.clone().requires_grad_() for t in (x0, qw0, kw0, vw0))
-    q2, k2, v2 = norm_qkv_projection(
+    q2, k2, v2 = fused_attn_qkv_projection_identity_mix(
         x2, None, None, 1, None, qw2, kw2, vw2, cos, sin, n_head, n_kv_head, head_dim, 1.2, 1e-6
     )
     torch.autograd.backward((q2, k2, v2), (qg, kg, vg))
@@ -468,7 +468,7 @@ def test_norm_qkv_projection_head64_backward():
             f"{name}.grad max diff {(ref - got).abs().max():.4e}"
 
 
-def test_norm_qkv_projection_backward_formula():
+def test_fused_attn_qkv_projection_backward_formula():
     torch.manual_seed(0)
     M, K, n_head, n_kv_head, head_dim = 16, 128, 2, 1, 128
     x0 = torch.randn(M, K, dtype=torch.float32, device="cuda")
@@ -483,7 +483,7 @@ def test_norm_qkv_projection_backward_formula():
     vg = torch.randn(M, n_kv_head, head_dim, dtype=torch.float32, device="cuda")
 
     x1, qw1, kw1, vw1 = (t.clone().requires_grad_() for t in (x0, qw0, kw0, vw0))
-    q1, k1, v1 = _norm_qkv_projection_ref(
+    q1, k1, v1 = _fused_attn_qkv_projection_ref(
         x1, None, None, 1, None, qw1, kw1, vw1, cos, sin, n_head, n_kv_head, head_dim, 1.2, 1e-6
     )
     torch.autograd.backward((q1, k1, v1), (qg, kg, vg))
@@ -492,7 +492,7 @@ def test_norm_qkv_projection_backward_formula():
     resid_scale = torch.ones((), dtype=x0.dtype, device=x0.device)
     x0_scale = torch.zeros((), dtype=x0.dtype, device=x0.device)
     q_saved, k_saved, _v_saved, _x_mix, rms_inv, qk_rms_inv = (
-        _norm_qkv_projection_with_residual_mix_fwd_op(
+        _fused_attn_qkv_projection_fwd_op(
             x0.view(1, M, K),
             ident_x0,
             resid_scale,
@@ -523,7 +523,7 @@ def test_norm_qkv_projection_backward_formula():
         d_q_weight,
         d_k_weight,
         d_v_weight,
-    ) = _norm_qkv_projection_with_residual_mix_bwd_impl(
+    ) = _fused_attn_qkv_projection_bwd_impl(
         qg.view(1, M, n_head, head_dim),
         kg.view(1, M, n_kv_head, head_dim),
         vg.view(1, M, n_kv_head, head_dim),
@@ -564,7 +564,7 @@ def test_norm_qkv_projection_backward_formula():
             f"{name}.grad max diff {(ref - got).abs().max():.4e}"
 
 
-def test_norm_qkv_projection_residual_mix_backward():
+def test_fused_attn_qkv_projection_residual_mix_backward():
     torch.manual_seed(0)
     B, T, K, n_head, n_kv_head, head_dim = 2, 8, 128, 2, 1, 64
     dtype = torch.float32
@@ -591,7 +591,7 @@ def test_norm_qkv_projection_residual_mix_backward():
         resid_scale = resid_scale_base.clone().requires_grad_()
         x0_scale = x0_scale_base.clone().requires_grad_()
         if use_triton:
-            q, k, v, x_mix = norm_qkv_projection_with_residual_mix(
+            q, k, v, x_mix = _fused_attn_qkv_projection(
                 x,
                 x0,
                 resid_scale,
@@ -613,7 +613,7 @@ def test_norm_qkv_projection_residual_mix_backward():
             )
         else:
             x_mix = resid_scale * x + x0_scale * x0
-            q, k, v = _norm_qkv_projection_ref(
+            q, k, v = _fused_attn_qkv_projection_ref(
                 x_mix,
                 None,
                 None,
@@ -653,7 +653,7 @@ def test_norm_qkv_projection_residual_mix_backward():
             f"{name}.grad max diff {max_diff:.4e}"
 
 
-def test_attn_output_proj_residual_backward():
+def test_fused_attn_spda_and_output_backward():
     torch.manual_seed(0)
     B, T, H, D, C, W = 1, 32, 4, 16, 64, 8
     q0 = torch.randn(B, T, H, D, dtype=torch.bfloat16, device="cuda")
@@ -680,7 +680,7 @@ def test_attn_output_proj_residual_backward():
 
     q2, k2, v2 = q0.clone().requires_grad_(), k0.clone().requires_grad_(), v0.clone().requires_grad_()
     w2, r2 = w0.clone().requires_grad_(), r0.clone().requires_grad_()
-    attn_output_proj_residual(q2, k2, v2, w2, r2, W).backward(g)
+    fused_attn_spda_and_output(q2, k2, v2, w2, r2, W).backward(g)
 
     for name, ref, got, atol in [
         ("q", q1.grad, q2.grad, 6e-2),

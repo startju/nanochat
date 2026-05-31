@@ -1,6 +1,6 @@
 """Attention SDPA-side Triton kernels for nanoops.
 
-Contains the SDPA-side kernels used by `attn_output_proj_residual`. Tensors use
+Contains the SDPA-side kernels used by `fused_attn_spda_and_output`. Tensors use
 `(B, T, H, D)` layout:
 
   - `q`: `(B, T, H_q, D)`, CUDA contiguous, dtype in {bf16, fp16, fp32}.
@@ -28,7 +28,7 @@ except ImportError:
     _HAS_TRITON = False
 
 
-def _pick_attn_sdpa_fwd_tile_config(
+def _pick_fused_attn_spda_fwd_tile_config(
     head_dim: int,
 ) -> tuple[int, int, int, int]:
     """Return `(block_m, block_n, num_warps, num_stages)` for SDPA forward.
@@ -37,7 +37,7 @@ def _pick_attn_sdpa_fwd_tile_config(
       head_dim: Attention head width `D`.
 
     Returns:
-      Tile and launch parameters for `_attn_sdpa_fwd_kernel`.
+      Tile and launch parameters for `_fused_attn_spda_fwd_kernel`.
     """
     if head_dim >= 128:
         # d24 forward sweep winner (B=1, T=2048, H=12, D=128, bf16).
@@ -45,7 +45,7 @@ def _pick_attn_sdpa_fwd_tile_config(
     return 64, 64, 4, 1
 
 
-def _pick_attn_sdpa_dq_tile_config(
+def _pick_fused_attn_spda_dq_tile_config(
     head_dim: int,
 ) -> tuple[int, int, int, int]:
     """Return `(block_m, block_n, num_warps, num_stages)` for dQ backward.
@@ -59,7 +59,7 @@ def _pick_attn_sdpa_dq_tile_config(
     return 64, 64, 4, 1
 
 
-def _pick_attn_sdpa_dkv_tile_config(
+def _pick_fused_attn_spda_dkv_tile_config(
     head_dim: int,
 ) -> tuple[int, int, int, int]:
     """Return `(block_m, block_n, num_warps, num_stages)` for dKV."""
@@ -68,7 +68,7 @@ def _pick_attn_sdpa_dkv_tile_config(
     return 64, 64, 4, 1
 
 
-def _pick_attn_sdpa_gqa_block_m(block_m: int, gqa_group: int) -> int:
+def _pick_fused_attn_spda_gqa_block_m(block_m: int, gqa_group: int) -> int:
     """Return per-head `BLOCK_M` after packing GQA query heads together.
 
     Args:
@@ -155,7 +155,7 @@ def _pick_attn_sdpa_gqa_block_m(block_m: int, gqa_group: int) -> int:
 if _HAS_TRITON:
 
     @triton.jit
-    def _attn_sdpa_fwd_kernel(
+    def _fused_attn_spda_fwd_kernel(
         Q,  # (B, M, H_Q, D) — in: query
         K,  # (B, N, H_KV, D) — in: key
         V,  # (B, N, H_KV, D) — in: value
@@ -385,7 +385,7 @@ if _HAS_TRITON:
         tl.store(lse_ptrs, lse, mask=hm_mask)
 
     @triton.jit
-    def _attn_sdpa_dq_bwd_kernel(
+    def _fused_attn_spda_dq_bwd_kernel(
         Q,  # (B, M, H_Q, D) — in: query
         K,  # (B, N, H_KV, D) — in: key
         V,  # (B, N, H_KV, D) — in: value
@@ -586,7 +586,7 @@ if _HAS_TRITON:
         tl.store(dq_ptrs, dq_acc.to(dQ.dtype.element_ty), mask=hm_mask[:, None])
 
     @triton.jit
-    def _attn_sdpa_dkv_bwd_kernel(
+    def _fused_attn_spda_dkv_bwd_kernel(
         Q,  # (B, M, H_Q, D) — in: query
         K,  # (B, N, H_KV, D) — in: key
         V,  # (B, N, H_KV, D) — in: value
@@ -819,7 +819,7 @@ if _HAS_TRITON:
         tl.store(dv_ptrs, dv_acc.to(dV.dtype.element_ty), mask=n_mask[:, None])
 
 
-def _attn_sdpa_fwd_impl(
+def _fused_attn_spda_fwd_impl(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -838,7 +838,7 @@ def _attn_sdpa_fwd_impl(
       lse: (B, M, H_q), fp32 row log-sum-exp for backward.
     """
     if not _HAS_TRITON:
-        raise RuntimeError("attn_sdpa requires triton")
+        raise RuntimeError("fused_attn_spda requires triton")
     assert q.is_cuda and k.is_cuda and v.is_cuda
     assert q.is_contiguous() and k.is_contiguous() and v.is_contiguous()
     assert q.ndim == k.ndim == v.ndim == 4
@@ -846,7 +846,7 @@ def _attn_sdpa_fwd_impl(
     B_k, N, h_kv, D_k = k.shape
     assert v.shape == (B_k, N, h_kv, D_k)
     assert B == B_k and D == D_k, f"q{k.shape=} / {q.shape=} / {v.shape=}"
-    assert M == N, f"attn_sdpa v1 requires same query/key length, got M={M}, N={N}"
+    assert M == N, f"fused_attn_spda v1 requires same query/key length, got M={M}, N={N}"
     assert h_q % h_kv == 0, f"H_q={h_q} must be divisible by H_kv={h_kv}"
     gqa_group = h_q // h_kv
     sm_scale = D**-0.5
@@ -856,11 +856,11 @@ def _attn_sdpa_fwd_impl(
 
     # Keep tensor layout as `(B, T, H, D)` into Triton. The launch grid
     # prioritizes batch/row tiles on axis 0 and uses axis 1 for heads.
-    block_m, block_n, num_warps, num_stages = _pick_attn_sdpa_fwd_tile_config(D)
-    segment_block_m = _pick_attn_sdpa_gqa_block_m(block_m, gqa_group)
+    block_m, block_n, num_warps, num_stages = _pick_fused_attn_spda_fwd_tile_config(D)
+    segment_block_m = _pick_fused_attn_spda_gqa_block_m(block_m, gqa_group)
     m_tiles = triton.cdiv(M, segment_block_m)
     grid = (B * m_tiles, h_kv)
-    wrap_triton(_attn_sdpa_fwd_kernel)[grid](
+    wrap_triton(_fused_attn_spda_fwd_kernel)[grid](
         q,
         k,
         v,
@@ -885,7 +885,7 @@ def _attn_sdpa_fwd_impl(
     return out, lse
 
 
-def _attn_sdpa_bwd_impl(
+def _fused_attn_spda_bwd_impl(
     do: torch.Tensor,
     q: torch.Tensor,
     k: torch.Tensor,
@@ -901,7 +901,7 @@ def _attn_sdpa_bwd_impl(
     `d_attn_out`.
     """
     if not _HAS_TRITON:
-        raise RuntimeError("attn_sdpa backward requires triton")
+        raise RuntimeError("fused_attn_spda backward requires triton")
     do = do.contiguous()
     B, M, h_q, D = q.shape
     B_k, N, h_kv, D_k = k.shape
@@ -913,9 +913,9 @@ def _attn_sdpa_bwd_impl(
     assert h_q % h_kv == 0
     gqa_group = h_q // h_kv
     sm_scale = D**-0.5
-    dq_block_m, dq_block_n, dq_warps, dq_stages = _pick_attn_sdpa_dq_tile_config(D)
+    dq_block_m, dq_block_n, dq_warps, dq_stages = _pick_fused_attn_spda_dq_tile_config(D)
     dkv_block_m, dkv_block_n, dkv_warps, dkv_stages = (
-        _pick_attn_sdpa_dkv_tile_config(D)
+        _pick_fused_attn_spda_dkv_tile_config(D)
     )
 
     # Split FlashAttention-style backward:
@@ -924,11 +924,11 @@ def _attn_sdpa_bwd_impl(
     dq = torch.empty_like(q)
     dk = torch.empty_like(k)
     dv = torch.empty_like(v)
-    dq_segment_block_m = _pick_attn_sdpa_gqa_block_m(dq_block_m, gqa_group)
-    dkv_segment_block_m = _pick_attn_sdpa_gqa_block_m(dkv_block_m, gqa_group)
+    dq_segment_block_m = _pick_fused_attn_spda_gqa_block_m(dq_block_m, gqa_group)
+    dkv_segment_block_m = _pick_fused_attn_spda_gqa_block_m(dkv_block_m, gqa_group)
     m_tiles = triton.cdiv(M, dq_segment_block_m)
     grid_dq = (B * m_tiles, h_kv)
-    wrap_triton(_attn_sdpa_dq_bwd_kernel)[grid_dq](
+    wrap_triton(_fused_attn_spda_dq_bwd_kernel)[grid_dq](
         q,
         k,
         v,
@@ -954,7 +954,7 @@ def _attn_sdpa_bwd_impl(
     )
     n_tiles = triton.cdiv(N, dkv_block_n)
     grid_dkv = (B * n_tiles, h_kv)
-    wrap_triton(_attn_sdpa_dkv_bwd_kernel)[grid_dkv](
+    wrap_triton(_fused_attn_spda_dkv_bwd_kernel)[grid_dkv](
         q,
         k,
         v,
@@ -983,24 +983,24 @@ def _attn_sdpa_bwd_impl(
 
 
 @torch.library.triton_op(
-    "nanoops::attn_sdpa_fwd",
+    "nanoops::fused_attn_spda_fwd",
     mutates_args=(),
 )
-def _attn_sdpa_fwd_op(
+def _fused_attn_spda_fwd_op(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
     window_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Triton-op forward wrapper for the backward-from-delta path."""
-    return _attn_sdpa_fwd_impl(q, k, v, window_size)
+    return _fused_attn_spda_fwd_impl(q, k, v, window_size)
 
 
 @torch.library.triton_op(
-    "nanoops::attn_sdpa_bwd",
+    "nanoops::fused_attn_spda_bwd",
     mutates_args=(),
 )
-def _attn_sdpa_bwd_op(
+def _fused_attn_spda_bwd_op(
     do: torch.Tensor,
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1010,4 +1010,4 @@ def _attn_sdpa_bwd_op(
     window_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Triton-op backward wrapper using caller-provided `delta`."""
-    return _attn_sdpa_bwd_impl(do, q, k, v, lse, delta, window_size)
+    return _fused_attn_spda_bwd_impl(do, q, k, v, lse, delta, window_size)
