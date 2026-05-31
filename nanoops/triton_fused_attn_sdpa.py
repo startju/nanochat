@@ -1,7 +1,7 @@
 """Attention SDPA-side Triton kernels for nanoops.
 
-Contains `attn_sdpa`: Flash-style sliding-causal scaled dot-product attention
-for training. Public tensors use `(B, T, H, D)` layout:
+Contains the SDPA-side kernels used by `attn_output_proj_residual`. Tensors use
+`(B, T, H, D)` layout:
 
   - `q`: `(B, T, H_q, D)`, CUDA contiguous, dtype in {bf16, fp16, fp32}.
   - `k`: `(B, T, H_kv, D)`, CUDA contiguous, same dtype family as `q`.
@@ -9,13 +9,12 @@ for training. Public tensors use `(B, T, H, D)` layout:
   - return: `(B, T, H_q, D)`, dtype=`q.dtype`.
 
 `H_q` may be larger than `H_kv` for GQA; `H_q % H_kv == 0`.
-The backward is split into FlashAttention-style `delta`, `dQ`, and `dK/dV`
-passes so each output gradient tile has one owner and dK/dV do not need atomics.
+This module intentionally exposes only internal triton_op wrappers. The fused
+output-projection path produces FlashAttention-style `delta` in its own
+backward kernel and then calls the SDPA backward-from-delta kernels.
 """
 
 from __future__ import annotations
-
-from typing import Any
 
 import torch
 from torch.library import wrap_triton
@@ -46,19 +45,25 @@ def _pick_attn_sdpa_fwd_tile_config(
     return 64, 64, 4, 1
 
 
-def _pick_attn_sdpa_bwd_tile_config(
+def _pick_attn_sdpa_dq_tile_config(
     head_dim: int,
 ) -> tuple[int, int, int, int]:
-    """Return `(block_m, block_n, num_warps, num_stages)` for split SDPA backward.
+    """Return `(block_m, block_n, num_warps, num_stages)` for dQ backward.
 
-    Args:
-      head_dim: Attention head width `D`.
-
-    Returns:
-      Tile and launch parameters shared by delta/dQ/dK/dV backward kernels.
+    dQ is Q-owned, so it can be tuned independently from the K/V-owned dKV
+    pass. Defaults are the current d24 winners; benchmark harnesses can
+    monkeypatch these constants/functions before `torch.compile`.
     """
     if head_dim >= 128:
-        # d24 split-bwd sweep winner. Larger forward tiles OOR in dKV.
+        return 32, 32, 4, 1
+    return 64, 64, 4, 1
+
+
+def _pick_attn_sdpa_dkv_tile_config(
+    head_dim: int,
+) -> tuple[int, int, int, int]:
+    """Return `(block_m, block_n, num_warps, num_stages)` for dKV."""
+    if head_dim >= 128:
         return 32, 32, 4, 1
     return 64, 64, 4, 1
 
@@ -130,6 +135,12 @@ def _pick_attn_sdpa_gqa_block_m(block_m: int, gqa_group: int) -> int:
 # Sliding-window mask: per-tile lower-bound `j ≥ i - W + 1`. Combined
 # with causal `j ≤ i`, this lets us skip entire K/V tiles whose j range
 # is outside [i_min - W + 1, i_max].
+# Forward and dQ split streamed K/V tiles into:
+#   left boundary  — needs causal/window elementwise mask
+#   full-valid     — every row in the Q tile can see every key in the K tile
+#   right boundary — needs causal/window elementwise mask
+# dKV mirrors that idea along the Q-tile loop. Full-context causal attention
+# is a constexpr fast path that drops the sliding-window lower-bound check.
 #
 # Scope of v1:
 #   - Supports GQA when H_q is an integer multiple of H_kv. Each query head
@@ -161,6 +172,7 @@ if _HAS_TRITON:
         BLOCK_N: tl.constexpr,
         M_TILES: tl.constexpr,
         GQA_GROUP: tl.constexpr,
+        IS_FULL_CONTEXT: tl.constexpr,
         D: tl.constexpr,
     ):
         """GQA forward: one program per (batch, Q-row tile, K/V head).
@@ -209,8 +221,18 @@ if _HAS_TRITON:
         l_i = tl.zeros((GQA_GROUP * BLOCK_M,), dtype=tl.float32)
         acc = tl.zeros((GQA_GROUP * BLOCK_M, D), dtype=tl.float32)
 
+        q_first = pid_m * BLOCK_M
+        q_last = tl.minimum(M, q_first + BLOCK_M) - 1
+        full_tile_start = tl.maximum(
+            kv_tile_start,
+            tl.maximum(0, (q_last - WINDOW + 1 + BLOCK_N - 1) // BLOCK_N),
+        )
+        full_tile_start = tl.minimum(full_tile_start, kv_tile_end)
+        full_tile_end = tl.minimum(kv_tile_end, (q_first + 1) // BLOCK_N)
+        full_tile_end = tl.maximum(full_tile_end, full_tile_start)
+
         offs_n_base = tl.arange(0, BLOCK_N)
-        for kv_idx in range(kv_tile_start, kv_tile_end):
+        for kv_idx in range(kv_tile_start, full_tile_start):
             offs_n = kv_idx * BLOCK_N + offs_n_base
             n_mask = (offs_n < N) & (kv_hid < H_KV)
 
@@ -234,12 +256,102 @@ if _HAS_TRITON:
             s = tl.dot(q, tl.trans(k_tile)) * sm_scale
             j = offs_n[None, :]
             i = offs_m[:, None]
-            mask_keep = (
-                (j <= i)
-                & (j >= i - WINDOW + 1)
-                & hm_mask[:, None]
-                & n_mask[None, :]
+            if IS_FULL_CONTEXT:
+                mask_keep = (j <= i) & hm_mask[:, None] & n_mask[None, :]
+            else:
+                mask_keep = (
+                    (j <= i)
+                    & (j >= i - WINDOW + 1)
+                    & hm_mask[:, None]
+                    & n_mask[None, :]
+                )
+            s = tl.where(mask_keep, s, -float("inf"))
+
+            m_new = tl.maximum(m_i, tl.max(s, axis=1))
+            all_masked = m_new == -float("inf")
+            alpha = tl.where(all_masked, 1.0, tl.exp(m_i - m_new))
+            p_unscaled = tl.where(
+                all_masked[:, None],
+                0.0,
+                tl.exp(s - m_new[:, None]),
             )
+            l_i = l_i * alpha + tl.sum(p_unscaled, axis=1)
+            acc = acc * alpha[:, None] + tl.dot(
+                p_unscaled.to(v_tile.dtype),
+                v_tile,
+            )
+            m_i = m_new
+        for kv_idx in range(full_tile_start, full_tile_end):
+            offs_n = kv_idx * BLOCK_N + offs_n_base
+            n_mask = (offs_n < N) & (kv_hid < H_KV)
+
+            k_ptrs = (
+                K
+                + batch_k_base
+                + offs_n[:, None] * H_KV * D
+                + kv_hid * D
+                + offs_d[None, :]
+            )
+            v_ptrs = (
+                V
+                + batch_k_base
+                + offs_n[:, None] * H_KV * D
+                + kv_hid * D
+                + offs_d[None, :]
+            )
+            k_tile = tl.load(k_ptrs, mask=n_mask[:, None], other=0.0)
+            v_tile = tl.load(v_ptrs, mask=n_mask[:, None], other=0.0)
+
+            s = tl.dot(q, tl.trans(k_tile)) * sm_scale
+            s = tl.where(hm_mask[:, None] & n_mask[None, :], s, -float("inf"))
+
+            m_new = tl.maximum(m_i, tl.max(s, axis=1))
+            all_masked = m_new == -float("inf")
+            alpha = tl.where(all_masked, 1.0, tl.exp(m_i - m_new))
+            p_unscaled = tl.where(
+                all_masked[:, None],
+                0.0,
+                tl.exp(s - m_new[:, None]),
+            )
+            l_i = l_i * alpha + tl.sum(p_unscaled, axis=1)
+            acc = acc * alpha[:, None] + tl.dot(
+                p_unscaled.to(v_tile.dtype),
+                v_tile,
+            )
+            m_i = m_new
+        for kv_idx in range(full_tile_end, kv_tile_end):
+            offs_n = kv_idx * BLOCK_N + offs_n_base
+            n_mask = (offs_n < N) & (kv_hid < H_KV)
+
+            k_ptrs = (
+                K
+                + batch_k_base
+                + offs_n[:, None] * H_KV * D
+                + kv_hid * D
+                + offs_d[None, :]
+            )
+            v_ptrs = (
+                V
+                + batch_k_base
+                + offs_n[:, None] * H_KV * D
+                + kv_hid * D
+                + offs_d[None, :]
+            )
+            k_tile = tl.load(k_ptrs, mask=n_mask[:, None], other=0.0)
+            v_tile = tl.load(v_ptrs, mask=n_mask[:, None], other=0.0)
+
+            s = tl.dot(q, tl.trans(k_tile)) * sm_scale
+            j = offs_n[None, :]
+            i = offs_m[:, None]
+            if IS_FULL_CONTEXT:
+                mask_keep = (j <= i) & hm_mask[:, None] & n_mask[None, :]
+            else:
+                mask_keep = (
+                    (j <= i)
+                    & (j >= i - WINDOW + 1)
+                    & hm_mask[:, None]
+                    & n_mask[None, :]
+                )
             s = tl.where(mask_keep, s, -float("inf"))
 
             m_new = tl.maximum(m_i, tl.max(s, axis=1))
@@ -273,42 +385,6 @@ if _HAS_TRITON:
         tl.store(lse_ptrs, lse, mask=hm_mask)
 
     @triton.jit
-    def _attn_sdpa_delta_bwd_kernel(
-        OUT,  # (B, M, H_Q, D) — in: forward output
-        dO,  # (B, M, H_Q, D) — in: gradient of output
-        DELTA,  # (B, M, H_Q) fp32 — out: row dot(O, dO)
-        B,  # int — batch size
-        H_Q,  # int — number of query/output heads
-        M,  # int — query sequence length
-        BLOCK_M: tl.constexpr,
-        M_TILES: tl.constexpr,
-        D: tl.constexpr,
-    ):
-        """Precompute Delta[i] = sum_j o[i, j] * dO[i, j] — used in bwd to skip
-        the inner softmax-bwd reduction. This is the classic Flash trick."""
-        pid_bm = tl.program_id(0)
-        hid = tl.program_id(1)
-        bid = pid_bm // M_TILES
-        pid_m = pid_bm - bid * M_TILES
-
-        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-        offs_d = tl.arange(0, D)
-        m_mask = offs_m < M
-        batch_q_base = bid * M * H_Q * D
-        batch_lse_base = bid * M * H_Q
-
-        head_mask = hid < H_Q
-        o_base = batch_q_base + hid * D
-        o_ptrs = OUT + o_base + offs_m[:, None] * H_Q * D + offs_d[None, :]
-        do_ptrs = dO + o_base + offs_m[:, None] * H_Q * D + offs_d[None, :]
-        mask = m_mask[:, None] & head_mask
-        o = tl.load(o_ptrs, mask=mask, other=0.0)
-        do = tl.load(do_ptrs, mask=mask, other=0.0)
-        d_row = tl.sum(o * do, axis=1, dtype=tl.float32)
-        d_ptrs = DELTA + batch_lse_base + offs_m * H_Q + hid
-        tl.store(d_ptrs, d_row, mask=m_mask & head_mask)
-
-    @triton.jit
     def _attn_sdpa_dq_bwd_kernel(
         Q,  # (B, M, H_Q, D) — in: query
         K,  # (B, N, H_KV, D) — in: key
@@ -328,6 +404,7 @@ if _HAS_TRITON:
         BLOCK_N: tl.constexpr,
         M_TILES: tl.constexpr,
         GQA_GROUP: tl.constexpr,
+        IS_FULL_CONTEXT: tl.constexpr,
         D: tl.constexpr,
     ):
         """Compute dQ for one `(batch, Q-row tile, K/V head)`.
@@ -384,8 +461,18 @@ if _HAS_TRITON:
         d_row = tl.load(d_ptrs, mask=hm_mask, other=0.0)
         dq_acc = tl.zeros((GQA_GROUP * BLOCK_M, D), dtype=tl.float32)
 
+        q_first = pid_m * BLOCK_M
+        q_last = tl.minimum(M, q_first + BLOCK_M) - 1
+        full_tile_start = tl.maximum(
+            kv_tile_start,
+            tl.maximum(0, (q_last - WINDOW + 1 + BLOCK_N - 1) // BLOCK_N),
+        )
+        full_tile_start = tl.minimum(full_tile_start, kv_tile_end)
+        full_tile_end = tl.minimum(kv_tile_end, (q_first + 1) // BLOCK_N)
+        full_tile_end = tl.maximum(full_tile_end, full_tile_start)
+
         offs_n_base = tl.arange(0, BLOCK_N)
-        for kv_idx in range(kv_tile_start, kv_tile_end):
+        for kv_idx in range(kv_tile_start, full_tile_start):
             offs_n = kv_idx * BLOCK_N + offs_n_base
             n_mask = (offs_n < N) & (kv_hid < H_KV)
             k_ptrs = (
@@ -408,12 +495,80 @@ if _HAS_TRITON:
             s = tl.dot(q, tl.trans(k_tile)) * sm_scale
             j = offs_n[None, :]
             i = offs_m[:, None]
-            mask_keep = (
-                (j <= i)
-                & (j >= i - WINDOW + 1)
-                & hm_mask[:, None]
-                & n_mask[None, :]
+            if IS_FULL_CONTEXT:
+                mask_keep = (j <= i) & hm_mask[:, None] & n_mask[None, :]
+            else:
+                mask_keep = (
+                    (j <= i)
+                    & (j >= i - WINDOW + 1)
+                    & hm_mask[:, None]
+                    & n_mask[None, :]
+                )
+            s = tl.where(mask_keep, s, -float("inf"))
+            p = tl.exp(s - lse[:, None])
+
+            dp = tl.dot(do, tl.trans(v_tile))
+            ds = p * (dp - d_row[:, None]) * sm_scale
+            dq_acc += tl.dot(ds.to(k_tile.dtype), k_tile)
+        for kv_idx in range(full_tile_start, full_tile_end):
+            offs_n = kv_idx * BLOCK_N + offs_n_base
+            n_mask = (offs_n < N) & (kv_hid < H_KV)
+            k_ptrs = (
+                K
+                + batch_k_base
+                + offs_n[:, None] * H_KV * D
+                + kv_hid * D
+                + offs_d[None, :]
             )
+            v_ptrs = (
+                V
+                + batch_k_base
+                + offs_n[:, None] * H_KV * D
+                + kv_hid * D
+                + offs_d[None, :]
+            )
+            k_tile = tl.load(k_ptrs, mask=n_mask[:, None], other=0.0)
+            v_tile = tl.load(v_ptrs, mask=n_mask[:, None], other=0.0)
+
+            s = tl.dot(q, tl.trans(k_tile)) * sm_scale
+            s = tl.where(hm_mask[:, None] & n_mask[None, :], s, -float("inf"))
+            p = tl.exp(s - lse[:, None])
+
+            dp = tl.dot(do, tl.trans(v_tile))
+            ds = p * (dp - d_row[:, None]) * sm_scale
+            dq_acc += tl.dot(ds.to(k_tile.dtype), k_tile)
+        for kv_idx in range(full_tile_end, kv_tile_end):
+            offs_n = kv_idx * BLOCK_N + offs_n_base
+            n_mask = (offs_n < N) & (kv_hid < H_KV)
+            k_ptrs = (
+                K
+                + batch_k_base
+                + offs_n[:, None] * H_KV * D
+                + kv_hid * D
+                + offs_d[None, :]
+            )
+            v_ptrs = (
+                V
+                + batch_k_base
+                + offs_n[:, None] * H_KV * D
+                + kv_hid * D
+                + offs_d[None, :]
+            )
+            k_tile = tl.load(k_ptrs, mask=n_mask[:, None], other=0.0)
+            v_tile = tl.load(v_ptrs, mask=n_mask[:, None], other=0.0)
+
+            s = tl.dot(q, tl.trans(k_tile)) * sm_scale
+            j = offs_n[None, :]
+            i = offs_m[:, None]
+            if IS_FULL_CONTEXT:
+                mask_keep = (j <= i) & hm_mask[:, None] & n_mask[None, :]
+            else:
+                mask_keep = (
+                    (j <= i)
+                    & (j >= i - WINDOW + 1)
+                    & hm_mask[:, None]
+                    & n_mask[None, :]
+                )
             s = tl.where(mask_keep, s, -float("inf"))
             p = tl.exp(s - lse[:, None])
 
@@ -451,6 +606,7 @@ if _HAS_TRITON:
         BLOCK_N: tl.constexpr,
         N_TILES: tl.constexpr,
         GQA_GROUP: tl.constexpr,
+        IS_FULL_CONTEXT: tl.constexpr,
         D: tl.constexpr,
     ):
         """Compute dK/dV for one `(batch, K/V-tile, K/V head)`.
@@ -497,13 +653,21 @@ if _HAS_TRITON:
         q_tile_start = kv_start // BLOCK_M
         q_high = tl.minimum(M, kv_start + BLOCK_N + WINDOW - 1)
         q_tile_end = (q_high + BLOCK_M - 1) // BLOCK_M
+        kv_last = tl.minimum(N, kv_start + BLOCK_N) - 1
+        full_q_tile_start = tl.maximum(
+            q_tile_start,
+            (kv_last + BLOCK_M - 1) // BLOCK_M,
+        )
+        full_q_tile_start = tl.minimum(full_q_tile_start, q_tile_end)
+        full_q_tile_end = tl.minimum(q_tile_end, (kv_start + WINDOW) // BLOCK_M)
+        full_q_tile_end = tl.maximum(full_q_tile_end, full_q_tile_start)
 
         offs_hm = tl.arange(0, GQA_GROUP * BLOCK_M)
         row_in_tile = offs_hm // GQA_GROUP
         head_off = offs_hm - row_in_tile * GQA_GROUP
         hid = kv_hid * GQA_GROUP + head_off
 
-        for q_idx in range(q_tile_start, q_tile_end):
+        for q_idx in range(q_tile_start, full_q_tile_start):
             offs_m = q_idx * BLOCK_M + row_in_tile
             hm_mask = (
                 (offs_m < M)
@@ -535,12 +699,100 @@ if _HAS_TRITON:
             s = tl.dot(q, tl.trans(k_tile)) * sm_scale
             j = offs_n[None, :]
             i = offs_m[:, None]
-            mask_keep = (
-                (j <= i)
-                & (j >= i - WINDOW + 1)
-                & hm_mask[:, None]
-                & n_mask[None, :]
+            if IS_FULL_CONTEXT:
+                mask_keep = (j <= i) & hm_mask[:, None] & n_mask[None, :]
+            else:
+                mask_keep = (
+                    (j <= i)
+                    & (j >= i - WINDOW + 1)
+                    & hm_mask[:, None]
+                    & n_mask[None, :]
+                )
+            s = tl.where(mask_keep, s, -float("inf"))
+            p = tl.exp(s - lse[:, None])
+
+            dv_acc += tl.dot(tl.trans(p).to(do.dtype), do)
+            dp = tl.dot(do, tl.trans(v_tile))
+            ds = p * (dp - d_row[:, None]) * sm_scale
+            dk_acc += tl.dot(tl.trans(ds).to(q.dtype), q)
+        for q_idx in range(full_q_tile_start, full_q_tile_end):
+            offs_m = q_idx * BLOCK_M + row_in_tile
+            hm_mask = (
+                (offs_m < M)
+                & (kv_hid < H_KV)
+                & (hid < H_Q)
             )
+
+            q_ptrs = (
+                Q
+                + batch_q_base
+                + offs_m[:, None] * H_Q * D
+                + hid[:, None] * D
+                + offs_d[None, :]
+            )
+            do_ptrs = (
+                dO
+                + batch_q_base
+                + offs_m[:, None] * H_Q * D
+                + hid[:, None] * D
+                + offs_d[None, :]
+            )
+            lse_ptrs = LSE + batch_lse_base + offs_m * H_Q + hid
+            d_ptrs = DELTA + batch_lse_base + offs_m * H_Q + hid
+            q = tl.load(q_ptrs, mask=hm_mask[:, None], other=0.0)
+            do = tl.load(do_ptrs, mask=hm_mask[:, None], other=0.0)
+            lse = tl.load(lse_ptrs, mask=hm_mask, other=0.0)
+            d_row = tl.load(d_ptrs, mask=hm_mask, other=0.0)
+
+            s = tl.dot(q, tl.trans(k_tile)) * sm_scale
+            s = tl.where(hm_mask[:, None] & n_mask[None, :], s, -float("inf"))
+            p = tl.exp(s - lse[:, None])
+
+            dv_acc += tl.dot(tl.trans(p).to(do.dtype), do)
+            dp = tl.dot(do, tl.trans(v_tile))
+            ds = p * (dp - d_row[:, None]) * sm_scale
+            dk_acc += tl.dot(tl.trans(ds).to(q.dtype), q)
+        for q_idx in range(full_q_tile_end, q_tile_end):
+            offs_m = q_idx * BLOCK_M + row_in_tile
+            hm_mask = (
+                (offs_m < M)
+                & (kv_hid < H_KV)
+                & (hid < H_Q)
+            )
+
+            q_ptrs = (
+                Q
+                + batch_q_base
+                + offs_m[:, None] * H_Q * D
+                + hid[:, None] * D
+                + offs_d[None, :]
+            )
+            do_ptrs = (
+                dO
+                + batch_q_base
+                + offs_m[:, None] * H_Q * D
+                + hid[:, None] * D
+                + offs_d[None, :]
+            )
+            lse_ptrs = LSE + batch_lse_base + offs_m * H_Q + hid
+            d_ptrs = DELTA + batch_lse_base + offs_m * H_Q + hid
+            q = tl.load(q_ptrs, mask=hm_mask[:, None], other=0.0)
+            do = tl.load(do_ptrs, mask=hm_mask[:, None], other=0.0)
+            lse = tl.load(lse_ptrs, mask=hm_mask, other=0.0)
+            d_row = tl.load(d_ptrs, mask=hm_mask, other=0.0)
+
+            s = tl.dot(q, tl.trans(k_tile)) * sm_scale
+            j = offs_n[None, :]
+            i = offs_m[:, None]
+            if IS_FULL_CONTEXT:
+                mask_keep = (j <= i) & hm_mask[:, None] & n_mask[None, :]
+            else:
+                mask_keep = (
+                    (j <= i)
+                    & (j >= i - WINDOW + 1)
+                    & hm_mask[:, None]
+                    & n_mask[None, :]
+                )
             s = tl.where(mask_keep, s, -float("inf"))
             p = tl.exp(s - lse[:, None])
 
@@ -625,6 +877,7 @@ def _attn_sdpa_fwd_impl(
         BLOCK_N=block_n,
         M_TILES=m_tiles,
         GQA_GROUP=gqa_group,
+        IS_FULL_CONTEXT=window_size >= M,
         D=D,
         num_warps=num_warps,
         num_stages=num_stages,
@@ -637,21 +890,15 @@ def _attn_sdpa_bwd_impl(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    out: torch.Tensor,
     lse: torch.Tensor,
+    delta: torch.Tensor,
     window_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Backprop for Flash-style sliding-causal SDPA.
+    """Backprop using precomputed `delta = sum(out * do)`.
 
-    Args:
-      do: (B, M, H_q, D), grad wrt forward output.
-      q/out: (B, M, H_q, D), saved forward query/output.
-      k/v: (B, M, H_kv, D), saved forward key/value.
-      lse: (B, M, H_q), fp32 saved forward row log-sum-exp.
-      window_size: total visible keys per query.
-
-    Returns:
-      dq, dk, dv with the same shapes/dtypes as q, k, v.
+    This is the only SDPA backward implementation. Callers must provide
+    `delta`; the fused output-projection path produces it while materializing
+    `d_attn_out`.
     """
     if not _HAS_TRITON:
         raise RuntimeError("attn_sdpa backward requires triton")
@@ -659,31 +906,16 @@ def _attn_sdpa_bwd_impl(
     B, M, h_q, D = q.shape
     B_k, N, h_kv, D_k = k.shape
     assert v.shape == (B_k, N, h_kv, D_k)
-    assert do.shape == q.shape and out.shape == q.shape
+    assert do.shape == q.shape
     assert lse.shape == (B, M, h_q)
+    assert delta.shape == (B, M, h_q)
     assert B == B_k and D == D_k and M == N
     assert h_q % h_kv == 0
     gqa_group = h_q // h_kv
     sm_scale = D**-0.5
-    block_m, block_n, num_warps, num_stages = _pick_attn_sdpa_bwd_tile_config(D)
-
-    # Delta[i] = sum_j out[i, j] * dO[i, j].
-    delta = torch.empty((B, M, h_q), dtype=torch.float32, device=q.device)
-    block_m_pre = block_m
-    m_tiles_pre = triton.cdiv(M, block_m_pre)
-    grid_pre = (B * m_tiles_pre, h_q)
-    wrap_triton(_attn_sdpa_delta_bwd_kernel)[grid_pre](
-        out,
-        do,
-        delta,
-        B,
-        h_q,
-        M,
-        BLOCK_M=block_m_pre,
-        M_TILES=m_tiles_pre,
-        D=D,
-        num_warps=num_warps,
-        num_stages=num_stages,
+    dq_block_m, dq_block_n, dq_warps, dq_stages = _pick_attn_sdpa_dq_tile_config(D)
+    dkv_block_m, dkv_block_n, dkv_warps, dkv_stages = (
+        _pick_attn_sdpa_dkv_tile_config(D)
     )
 
     # Split FlashAttention-style backward:
@@ -692,8 +924,9 @@ def _attn_sdpa_bwd_impl(
     dq = torch.empty_like(q)
     dk = torch.empty_like(k)
     dv = torch.empty_like(v)
-    segment_block_m = _pick_attn_sdpa_gqa_block_m(block_m, gqa_group)
-    m_tiles = triton.cdiv(M, segment_block_m)
+    dq_segment_block_m = _pick_attn_sdpa_gqa_block_m(dq_block_m, gqa_group)
+    dkv_segment_block_m = _pick_attn_sdpa_gqa_block_m(dkv_block_m, gqa_group)
+    m_tiles = triton.cdiv(M, dq_segment_block_m)
     grid_dq = (B * m_tiles, h_kv)
     wrap_triton(_attn_sdpa_dq_bwd_kernel)[grid_dq](
         q,
@@ -710,15 +943,16 @@ def _attn_sdpa_bwd_impl(
         M,
         N,
         WINDOW=window_size,
-        BLOCK_M=segment_block_m,
-        BLOCK_N=block_n,
+        BLOCK_M=dq_segment_block_m,
+        BLOCK_N=dq_block_n,
         M_TILES=m_tiles,
         GQA_GROUP=gqa_group,
+        IS_FULL_CONTEXT=window_size >= M,
         D=D,
-        num_warps=num_warps,
-        num_stages=num_stages,
+        num_warps=dq_warps,
+        num_stages=dq_stages,
     )
-    n_tiles = triton.cdiv(N, block_n)
+    n_tiles = triton.cdiv(N, dkv_block_n)
     grid_dkv = (B * n_tiles, h_kv)
     wrap_triton(_attn_sdpa_dkv_bwd_kernel)[grid_dkv](
         q,
@@ -736,13 +970,14 @@ def _attn_sdpa_bwd_impl(
         M,
         N,
         WINDOW=window_size,
-        BLOCK_M=segment_block_m,
-        BLOCK_N=block_n,
+        BLOCK_M=dkv_segment_block_m,
+        BLOCK_N=dkv_block_n,
         N_TILES=n_tiles,
         GQA_GROUP=gqa_group,
+        IS_FULL_CONTEXT=window_size >= M,
         D=D,
-        num_warps=num_warps,
-        num_stages=num_stages,
+        num_warps=dkv_warps,
+        num_stages=dkv_stages,
     )
     return dq, dk, dv
 
@@ -757,7 +992,7 @@ def _attn_sdpa_fwd_op(
     v: torch.Tensor,
     window_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Triton-op forward wrapper returning `(out, lse)`."""
+    """Triton-op forward wrapper for the backward-from-delta path."""
     return _attn_sdpa_fwd_impl(q, k, v, window_size)
 
 
@@ -770,65 +1005,9 @@ def _attn_sdpa_bwd_op(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    out: torch.Tensor,
     lse: torch.Tensor,
+    delta: torch.Tensor,
     window_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Triton-op backward wrapper returning `(dq, dk, dv)`."""
-    return _attn_sdpa_bwd_impl(do, q, k, v, out, lse, window_size)
-
-
-def _attn_sdpa_setup_context(
-    ctx: Any,
-    inputs: tuple[torch.Tensor, torch.Tensor, torch.Tensor, int],
-    output: tuple[torch.Tensor, torch.Tensor],
-) -> None:
-    """Save tensors for `nanoops::attn_sdpa_fwd` backward."""
-    q, k, v, window_size = inputs
-    out, lse = output
-    ctx.save_for_backward(q, k, v, out, lse)
-    ctx.window_size = window_size
-
-
-def _attn_sdpa_autograd_backward(
-    ctx: Any,
-    do: torch.Tensor,
-    _d_lse: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, None]:
-    """Autograd callback for Flash-style SDPA."""
-    q, k, v, out, lse = ctx.saved_tensors
-    dq, dk, dv = _attn_sdpa_bwd_op(do, q, k, v, out, lse, ctx.window_size)
-    return dq, dk, dv, None
-
-
-_attn_sdpa_fwd_op.register_autograd(
-    _attn_sdpa_autograd_backward,
-    setup_context=_attn_sdpa_setup_context,
-)
-
-
-def attn_sdpa(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    window_size: int,
-) -> torch.Tensor:
-    """Flash-style sliding-causal SDPA. q: (B, L, H_q, D), k/v: (B, L, H_kv, D).
-
-    window_size: total keys each query attends to (= nanchat's window+1).
-
-    Args:
-      q: (B, L, H_q, D) contiguous CUDA query tensor.
-      k: (B, L, H_kv, D) contiguous CUDA key tensor.
-      v: (B, L, H_kv, D) contiguous CUDA value tensor.
-      window_size: total visible keys per query.
-
-    Returns:
-      (B, L, H_q, D) attention output.
-    """
-    out, _lse = _attn_sdpa_fwd_op(q, k, v, window_size)
-    return out
-
-
-# Backward-compatible public name used by older integration/tests.
-flash_sdpa = attn_sdpa
+    """Triton-op backward wrapper using caller-provided `delta`."""
+    return _attn_sdpa_bwd_impl(do, q, k, v, lse, delta, window_size)

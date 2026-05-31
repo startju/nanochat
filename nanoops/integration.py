@@ -32,8 +32,6 @@ Patched ops:
     nanochat.gpt.GPT.forward             — optional fused attention QKV path
     nanochat.gpt.CausalSelfAttention.forward
                                           — optional L-layer activation ckpt
-    nanochat.flash_attention._sdpa_attention
-                                          — flash_sdpa training path + chunked fallback
     nanochat.optim.DistMuonAdamW._compute_adamw / _compute_muon
                                           — CPU optim state offload (dual-GPU)
     nanochat.optim.MuonAdamW._step_adamw / _step_muon
@@ -58,7 +56,6 @@ import torch.utils.checkpoint as _ckpt
 
 import nanoops.functional as nF
 from nanochat.common import COMPUTE_DTYPE
-from nanochat.flash_attention import flash_attn as _flash_attn
 
 
 # Captured at _apply() time so the L-attn checkpoint wrapper can call the
@@ -167,24 +164,7 @@ def _patched_block_forward(self, x, ve, cos_sin, window_size, kv_cache):
 _orig_norm = None
 _fused_mlp = None
 _fused_attn_qkv = None
-_fused_attn_output_proj = None
-
-
-def _flash_sdpa_training_mode() -> str:
-    """Return Triton SDPA training mode: '', 'sliding', or 'all'."""
-    mode = os.environ.get("NANOOPS_FLASH_SDPA_TRAINING", "all").lower()
-    if mode in {"0", "false", "off", "none", ""}:
-        return ""
-    if mode == "sliding":
-        return "sliding"
-    if mode in {"1", "true", "all"}:
-        return "all"
-    return ""
-
-
-def _use_flash_sdpa_for_window(window_size: int, sequence_len: int) -> bool:
-    mode = _flash_sdpa_training_mode()
-    return mode == "all" or (mode == "sliding" and window_size < sequence_len)
+_fused_attn_tail = None
 
 
 def _rms_norm_no_weight(x: torch.Tensor) -> torch.Tensor:
@@ -240,54 +220,12 @@ def _attn_qkv_residual(
     )
     window = window_size[0]
     sdpa_window = T if (window < 0 or window >= T) else window + 1
-    if _use_flash_sdpa_for_window(sdpa_window, T):
-        from .triton_fused_attn_sdpa import attn_sdpa as _triton_attn_sdpa
-
-        y = _triton_attn_sdpa(q, k, v, sdpa_window)
-    else:
-        y = nF.sliding_window_sdpa(
-            q.transpose(1, 2),
-            k.transpose(1, 2),
-            v.transpose(1, 2),
-            window_size=sdpa_window,
-            chunk_size=max(1, T // 8) if sdpa_window >= T else None,
-        ).transpose(1, 2)
-    y = y.contiguous().view(B * T, -1)
-    x_mix = x_mix.contiguous().view(B * T, -1)
-    y = _fused_attn_output_proj(y, attn.c_proj.weight, x_mix)
-    return y.view(B, T, -1)
+    return _fused_attn_tail(q, k, v, attn.c_proj.weight, x_mix, sdpa_window)
 
 
 def _attn_native_residual(self, x, ve, cos_sin, window_size):
     """Attention residual matching the non-QKV-fused Block.forward path."""
     return x + self.attn(_rms_norm_no_weight(x), ve, cos_sin, window_size, None)
-
-
-def _training_flash_sdpa_bhmd(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    window_size: int,
-) -> torch.Tensor:
-    """Run Triton SDPA for training inputs in `(B, H, M, D)` layout.
-
-    `nanochat.flash_attention.flash_attn_func` transposes its native
-    `(B, M, H, D)` tensors to PyTorch SDPA's `(B, H, M, D)` layout before
-    calling `_sdpa_attention`. The Triton kernel is intentionally kept in
-    `(B, M, H, D)`, so this helper translates the layout at the patch
-    boundary and returns `(B, H, M, D)` to preserve the original contract.
-    """
-    if not (q.is_cuda and k.is_cuda and v.is_cuda):
-        raise RuntimeError("Triton flash_sdpa training path requires CUDA tensors")
-    from .triton_fused_attn_sdpa import attn_sdpa as _triton_attn_sdpa
-
-    out = _triton_attn_sdpa(
-        q.transpose(1, 2).contiguous(),
-        k.transpose(1, 2).contiguous(),
-        v.transpose(1, 2).contiguous(),
-        window_size,
-    )
-    return out.transpose(1, 2)
 
 
 def _mlp_residual(self, x):
@@ -437,70 +375,6 @@ def _patched_l_attn_forward(self, x, ve, cos_sin, window_size, kv_cache):
     return _orig_attn_forward(self, x, ve, cos_sin, window_size, kv_cache)
 
 
-def _patched_sdpa_attention(q, k, v, window_size, enable_gqa):
-    """Replacement for nanchat.flash_attention._sdpa_attention.
-
-    Default training path uses Triton `flash_sdpa` for same-length CUDA
-    training attention. Set `NANOOPS_FLASH_SDPA_TRAINING=0` to force the
-    chunked `SlidingWindowSDPA` fallback, or `sliding` to use Triton only for
-    finite-window layers.
-
-    Inference paths keep the original behavior:
-      - single-token gen (Tq == 1): trim k/v + PyTorch SDPA
-      - cached gen (Tq != Tk): explicit causal+sliding mask + PyTorch SDPA
-    """
-    Tq = q.size(2)
-    Tk = k.size(2)
-    window = window_size[0]
-
-    # Full context, same length.
-    if (window < 0 or window >= Tq) and Tq == Tk:
-        if q.is_cuda and _use_flash_sdpa_for_window(Tq, Tq):
-            return _training_flash_sdpa_bhmd(q, k, v, Tq)
-        return nF.sliding_window_sdpa(
-            q,
-            k,
-            v,
-            window_size=Tq,
-            enable_gqa=enable_gqa,
-            chunk_size=max(1, Tq // 8),
-        )
-
-    # Single token generation — same path as original (left-trim k/v).
-    if Tq == 1:
-        if window >= 0 and window < Tk:
-            start = max(0, Tk - (window + 1))
-            k = k[:, :, start:, :]
-            v = v[:, :, start:, :]
-        return torch.nn.functional.scaled_dot_product_attention(
-            q, k, v, is_causal=False, enable_gqa=enable_gqa
-        )
-
-    # Sliding window during training (Tq == Tk, finite window).
-    if Tq == Tk and window >= 0 and window < Tq:
-        # Convention translation between nanchat and nanoops sliding window:
-        #   nanchat: window = max distance back (FA3-style "left" arg, 0..window
-        #            inclusive → window+1 distinct allowed key offsets incl. self)
-        #   nanoops: W      = TOTAL number of keys each query attends to
-        # So nanoops_W = nanchat_window + 1. See nanchat/flash_attention.py:85
-        # ("window is 'left' tokens we need to include (window + 1) keys total").
-        if q.is_cuda and _use_flash_sdpa_for_window(window + 1, Tq):
-            return _training_flash_sdpa_bhmd(q, k, v, window + 1)
-        return nF.sliding_window_sdpa(q, k, v, window + 1, enable_gqa=enable_gqa)
-
-    # Cached generation with chunk inference (Tq != Tk) — build explicit mask
-    # and fall back to one big SDPA call (sliding_window_sdpa assumes Tq == Tk).
-    device = q.device
-    row_idx = (Tk - Tq) + torch.arange(Tq, device=device).unsqueeze(1)
-    col_idx = torch.arange(Tk, device=device).unsqueeze(0)
-    mask = col_idx <= row_idx
-    if window >= 0 and window < Tk:
-        mask = mask & ((row_idx - col_idx) <= window)
-    return torch.nn.functional.scaled_dot_product_attention(
-        q, k, v, attn_mask=mask, enable_gqa=enable_gqa
-    )
-
-
 _TARGET_MODULES = [
     # nanchat modules — call F.* directly
     "nanochat.gpt",
@@ -546,7 +420,7 @@ def _apply() -> dict[str, dict]:
     instead of the true originals.
     """
     global _PATCHED, _orig_attn_forward, _orig_gpt_forward, _orig_norm
-    global _fused_mlp, _fused_attn_qkv, _fused_attn_output_proj
+    global _fused_mlp, _fused_attn_qkv, _fused_attn_tail
     if _PATCHED:
         raise RuntimeError(
             "nanoops.integration already patched; call _restore() before _apply() again"
@@ -595,7 +469,7 @@ def _apply() -> dict[str, dict]:
     # the fused op owns the outer RMSNorm that nanchat applies one level up in
     # Block.forward, and it needs token ids + VE table to fuse value embedding.
     if os.environ.get("NANOOPS_FUSED_ATTN_QKV"):
-        from .triton_fused_attn_output import attn_output_proj_residual as _aopr
+        from .triton_fused_attn_output import attn_output_proj_residual as _tail
         from .triton_fused_attn_qkv import norm_qkv_projection_with_residual_mix as _nqp
 
         assert _orig_gpt_forward is None, (
@@ -603,7 +477,7 @@ def _apply() -> dict[str, dict]:
         )
         _orig_gpt_forward = gpt_mod.GPT.forward
         _fused_attn_qkv = _nqp
-        _fused_attn_output_proj = _aopr
+        _fused_attn_tail = _tail
         originals["method"][("nanochat.gpt", "GPT", "forward")] = _orig_gpt_forward
         gpt_mod.GPT.forward = _patched_gpt_forward
     # L-layer activation checkpoint: opt-in via NANOOPS_L_ATTN_CHECKPOINT=1.
@@ -619,14 +493,6 @@ def _apply() -> dict[str, dict]:
             _orig_attn_forward
         )
         gpt_mod.CausalSelfAttention.forward = _patched_l_attn_forward
-    # Training SDPA patch: default is Triton flash_sdpa after the split
-    # backward removed dK/dV atomics. `NANOOPS_FLASH_SDPA_TRAINING=0` keeps the
-    # older chunked nanoops implementation available for A/B runs.
-    fa_mod = importlib.import_module("nanochat.flash_attention")
-    originals["module_func"][("nanochat.flash_attention", "_sdpa_attention")] = (
-        fa_mod._sdpa_attention
-    )
-    fa_mod._sdpa_attention = _patched_sdpa_attention
     # Optimizer CPU offload (opt-in via NANOOPS_OFFLOAD_OPTIM=1). Moves
     # DistMuonAdamW's per-rank optim state to CPU pinned memory; H2D/D2H
     # per optimizer step. Freed GPU memory: ~2.5 GB Muon state + ~300 MB
@@ -671,14 +537,14 @@ def _restore(originals: dict[str, dict]) -> None:
         cls = getattr(importlib.import_module(modname), cls_name)
         setattr(cls, method_name, original)
     global _PATCHED, _orig_attn_forward, _orig_gpt_forward, _orig_norm
-    global _fused_mlp, _fused_attn_qkv, _fused_attn_output_proj
+    global _fused_mlp, _fused_attn_qkv, _fused_attn_tail
     _PATCHED = False
     _orig_attn_forward = None
     _orig_gpt_forward = None
     _orig_norm = None
     _fused_mlp = None
     _fused_attn_qkv = None
-    _fused_attn_output_proj = None
+    _fused_attn_tail = None
 
 
 def patch_nanchat() -> list[str]:
@@ -690,13 +556,8 @@ def patch_nanchat() -> list[str]:
         + [f"{mod}.{attr}" for mod, attr in _MODULE_FUNC_OVERRIDES]
         + ["MLP.forward(relu_square fused)"]
     )
-    names.append("nanochat.flash_attention._sdpa_attention(flash_sdpa)")
     if os.environ.get("NANOOPS_MLP_CHECKPOINT"):
         names.append("MLP.forward(activation checkpoint)")
-    if _flash_sdpa_training_mode():
-        names.append(f"_sdpa_attention(Triton flash_sdpa {_flash_sdpa_training_mode()})")
-    else:
-        names.append("_sdpa_attention(full/sliding training → chunked sliding, default)")
     if os.environ.get("NANOOPS_OFFLOAD_OPTIM"):
         names.append("MuonAdamW/DistMuonAdamW(CPU optim state offload)")
     if os.environ.get("NANOOPS_L_ATTN_CHECKPOINT"):

@@ -1,20 +1,15 @@
-"""Attention-output Triton kernels for nanoops.
+"""Attention output-side Triton kernels for nanoops.
 
-Contains `attn_output_proj_residual`, the output-projection side of attention:
+Public entry: `attn_output_proj_residual`, the fused training attention tail:
 
-    y = residual + attn_out @ proj_weight.T
+    attn_out = sdpa(q, k, v)
+    y        = residual + attn_out @ proj_weight.T
 
-Public tensors use flattened `(M, D)` layout, where `M = B*T` for the
-training path:
-
-  - `attn_out`: `(M, D_in)`, CUDA contiguous, dtype is activation dtype.
-  - `proj_weight`: `(D_out, D_in)`, CUDA contiguous, usually fp32 master
-    weights or activation dtype.
-  - `residual`: `(M, D_out)`, CUDA contiguous, activation dtype.
-  - return: `(M, D_out)`, dtype=`attn_out.dtype`.
-
-Backward returns `d_attn_out = dy @ proj_weight` and
-`d_proj_weight = dy.T @ attn_out`; residual's gradient is the direct `dy`.
+Public tensors use `(B, T, H, D)` for Q/K/V and `(B, T, C)` for residual.
+Backward computes `d_attn_out = dy @ proj_weight`, `d_proj_weight =
+dy.T @ attn_out`, residual's direct gradient `dy`, and the SDPA softmax
+`delta = sum(attn_out * d_attn_out)` in the same pass that materializes
+`d_attn_out`.
 """
 
 from __future__ import annotations
@@ -34,7 +29,7 @@ except ImportError:
 
 
 # ─────────────────────────────────────────────────────────────────────
-# Attention output projection + residual.
+# Attention SDPA + output projection + residual.
 #
 # Forward math for flattened row m and output channel o:
 #   y[m, o] = residual[m, o] + Σ_i attn_out[m, i] * proj_weight[o, i]
@@ -44,9 +39,9 @@ except ImportError:
 #   d_proj_weight[o, i] = Σ_m dy[m, o] * attn_out[m, i]
 #   d_residual[m, o]    = dy[m, o]
 #
-# d_attn_out and d_proj_weight use separate kernels because their reductions
-# are over different axes. d_proj_weight is owned by `(D_out, D_in)` tiles and
-# reduces over M internally, so it does not need atomics.
+# d_attn_out/delta and d_proj_weight use separate kernels because their
+# reductions are over different axes. d_proj_weight is owned by `(D_out, D_in)`
+# tiles and reduces over M internally, so it does not need atomics.
 # ─────────────────────────────────────────────────────────────────────
 
 if _HAS_TRITON:
@@ -69,7 +64,7 @@ if _HAS_TRITON:
     _ATTN_OUTPUT_PROJ_DWEIGHT_NUM_STAGES = 1
 
     @triton.jit
-    def _attn_output_proj_residual_fwd_kernel(
+    def _attn_output_proj_fwd_kernel(
         attn_out_ptr,  # (M, D_in), activation dtype — in: attention output
         proj_w_ptr,  # (D_out, D_in), weight dtype — in: output projection weight
         residual_ptr,  # (M, D_out), activation dtype — in: residual stream
@@ -124,55 +119,68 @@ if _HAS_TRITON:
         tl.store(y_ptrs, y, mask=out_mask)
 
     @triton.jit
-    def _attn_output_proj_residual_dattn_bwd_kernel(
-        proj_w_ptr,  # (D_out, D_in), weight dtype — in: projection weight
-        dy_ptr,  # (M, D_out), activation dtype — in: output gradient
-        d_attn_out_ptr,  # (M, D_in), activation dtype — out
-        M,  # int — row count after flattening leading dims
+    def _attn_output_proj_dattn_delta_bwd_kernel(
+        attn_out_ptr,  # (M, H_Q*D_HEAD), activation dtype — in: SDPA output
+        proj_w_ptr,  # (D_out, H_Q*D_HEAD), weight dtype — in
+        dy_ptr,  # (M, D_out), activation dtype — in
+        d_attn_out_ptr,  # (M, H_Q*D_HEAD), activation dtype — out
+        delta_ptr,  # (M, H_Q) fp32 — out: sum_d(attn_out * d_attn_out)
+        M,  # int — flattened B*T rows
+        H_Q: tl.constexpr,  # query/output head count
+        D_HEAD: tl.constexpr,  # attention head width
         D_OUT: tl.constexpr,  # projection output width
-        D_IN: tl.constexpr,  # projection input width
         BLOCK_M: tl.constexpr,
         BLOCK_DOUT: tl.constexpr,
-        BLOCK_DIN: tl.constexpr,
     ):
-        """Compute `d_attn_out = dy @ proj_weight`."""
+        """Compute `d_attn_out` for one attention head and its SDPA.
+
+        This is the fused hand-off from output-projection backward to SDPA
+        backward:
+
+          d_attn_out[m, h, d] = sum_o dy[m, o] * proj_weight[o, h, d]
+          delta[m, h]         = sum_d attn_out[m, h, d] * d_attn_out[m, h, d]
+
+        The standalone SDPA backward normally launches a separate delta
+        kernel. The combined attention op uses this kernel to avoid that pass.
+        """
         pid_m = tl.program_id(0)
-        pid_din = tl.program_id(1)
+        hid = tl.program_id(1)
         rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-        din_cols = pid_din * BLOCK_DIN + tl.arange(0, BLOCK_DIN)
+        offs_d = tl.arange(0, D_HEAD)
         row_mask = rows < M
-        din_mask = din_cols < D_IN
+        head_mask = hid < H_Q
+        din_cols = hid * D_HEAD + offs_d
 
-        d_attn_acc = tl.zeros((BLOCK_M, BLOCK_DIN), dtype=tl.float32)
-
+        d_attn_acc = tl.zeros((BLOCK_M, D_HEAD), dtype=tl.float32)
         for dout_start in range(0, D_OUT, BLOCK_DOUT):
             dout_cols = dout_start + tl.arange(0, BLOCK_DOUT)
             dout_mask = dout_cols < D_OUT
-
-            dy_ptrs = dy_ptr + rows[:, None] * D_OUT + dout_cols[None, :]
             dy = tl.load(
-                dy_ptrs,
+                dy_ptr + rows[:, None] * D_OUT + dout_cols[None, :],
                 mask=row_mask[:, None] & dout_mask[None, :],
                 other=0.0,
             )
-            w_ptrs = proj_w_ptr + dout_cols[:, None] * D_IN + din_cols[None, :]
             w = tl.load(
-                w_ptrs,
-                mask=dout_mask[:, None] & din_mask[None, :],
+                proj_w_ptr + dout_cols[:, None] * (H_Q * D_HEAD) + din_cols[None, :],
+                mask=dout_mask[:, None] & head_mask,
                 other=0.0,
             ).to(dy.dtype)
-
             d_attn_acc += tl.dot(dy, w)
 
-        d_attn_ptrs = d_attn_out_ptr + rows[:, None] * D_IN + din_cols[None, :]
-        tl.store(
-            d_attn_ptrs,
-            d_attn_acc.to(d_attn_out_ptr.dtype.element_ty),
-            mask=row_mask[:, None] & din_mask[None, :],
+        d_attn = d_attn_acc.to(d_attn_out_ptr.dtype.element_ty)
+        out_ptrs = d_attn_out_ptr + rows[:, None] * (H_Q * D_HEAD) + din_cols[None, :]
+        tl.store(out_ptrs, d_attn, mask=row_mask[:, None] & head_mask)
+
+        attn = tl.load(
+            attn_out_ptr + rows[:, None] * (H_Q * D_HEAD) + din_cols[None, :],
+            mask=row_mask[:, None] & head_mask,
+            other=0.0,
         )
+        delta = tl.sum(attn * d_attn, axis=1, dtype=tl.float32)
+        tl.store(delta_ptr + rows * H_Q + hid, delta, mask=row_mask & head_mask)
 
     @triton.jit
-    def _attn_output_proj_residual_dweight_bwd_kernel(
+    def _attn_output_proj_dweight_bwd_kernel(
         attn_out_ptr,  # (M, D_in), activation dtype — in: forward attention output
         dy_ptr,  # (M, D_out), activation dtype — in: output gradient
         d_proj_w_ptr,  # (D_out, D_in), proj_weight dtype — out
@@ -214,7 +222,7 @@ if _HAS_TRITON:
         )
 
 
-def _attn_output_proj_residual_fwd_impl(
+def _attn_output_proj_fwd_impl(
     attn_out: torch.Tensor,
     proj_weight: torch.Tensor,
     residual: torch.Tensor,
@@ -244,7 +252,7 @@ def _attn_output_proj_residual_fwd_impl(
     BLOCK_DOUT = _ATTN_OUTPUT_PROJ_FWD_BLOCK_DOUT
     BLOCK_DIN = _ATTN_OUTPUT_PROJ_FWD_BLOCK_DIN
     grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(D_out, BLOCK_DOUT))
-    wrap_triton(_attn_output_proj_residual_fwd_kernel)[grid](
+    wrap_triton(_attn_output_proj_fwd_kernel)[grid](
         attn_out,
         proj_weight,
         residual,
@@ -261,56 +269,66 @@ def _attn_output_proj_residual_fwd_impl(
     return y
 
 
-def _attn_output_proj_residual_bwd_impl(
+def _attn_output_proj_dattn_delta_bwd_impl(
     dy: torch.Tensor,
     attn_out: torch.Tensor,
     proj_weight: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Launch backward kernels for `y = residual + attn_out @ proj_weight.T`.
+    n_head: int,
+    head_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Backward for output projection, also producing SDPA `delta`.
 
     Args:
-      dy: `(M, D_out)` gradient of output. Made contiguous before launch.
-      attn_out: `(M, D_in)` saved forward attention output.
-      proj_weight: `(D_out, D_in)` saved projection weight.
+      dy: `(M, D_out)` output gradient.
+      attn_out: `(M, n_head * head_dim)` saved SDPA output.
+      proj_weight: `(D_out, n_head * head_dim)` projection weight.
+      n_head: number of attention output heads.
+      head_dim: per-head width.
 
     Returns:
-      d_attn_out: `(M, D_in)`, dtype=`attn_out.dtype`.
-      d_proj_weight: `(D_out, D_in)`, dtype=`proj_weight.dtype`.
+      d_attn_out: `(M, n_head * head_dim)`.
+      d_proj_weight: `(D_out, n_head * head_dim)`.
+      delta: `(M, n_head)` fp32, where `delta[m, h] = dot(attn_out, d_attn_out)`.
     """
     if not _HAS_TRITON:
         raise RuntimeError("attn_output_proj_residual backward requires triton")
     dy = dy.contiguous()
     assert dy.is_cuda and attn_out.is_cuda and proj_weight.is_cuda
     assert dy.is_contiguous() and attn_out.is_contiguous() and proj_weight.is_contiguous()
+    assert dy.ndim == attn_out.ndim == proj_weight.ndim == 2
     M, D_in = attn_out.shape
     M_dy, D_out = dy.shape
     D_out_w, D_in_w = proj_weight.shape
     assert M == M_dy and D_in == D_in_w and D_out == D_out_w
+    assert D_in == n_head * head_dim
 
     d_attn_out = torch.empty_like(attn_out)
-    d_proj_weight = torch.empty_like(proj_weight)
+    delta = torch.empty((M, n_head), dtype=torch.float32, device=attn_out.device)
     BLOCK_M = _ATTN_OUTPUT_PROJ_DATTN_BLOCK_M
     BLOCK_DOUT = _ATTN_OUTPUT_PROJ_DATTN_BLOCK_DOUT
-    BLOCK_DIN = _ATTN_OUTPUT_PROJ_DATTN_BLOCK_DIN
-    dattn_grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(D_in, BLOCK_DIN))
-    wrap_triton(_attn_output_proj_residual_dattn_bwd_kernel)[dattn_grid](
+    dattn_grid = (triton.cdiv(M, BLOCK_M), n_head)
+    wrap_triton(_attn_output_proj_dattn_delta_bwd_kernel)[dattn_grid](
+        attn_out,
         proj_weight,
         dy,
         d_attn_out,
+        delta,
         M,
-        D_out,
-        D_in,
+        n_head,
+        head_dim,
+        D_OUT=D_out,
         BLOCK_M=BLOCK_M,
         BLOCK_DOUT=BLOCK_DOUT,
-        BLOCK_DIN=BLOCK_DIN,
         num_warps=_ATTN_OUTPUT_PROJ_DATTN_NUM_WARPS,
         num_stages=_ATTN_OUTPUT_PROJ_DATTN_NUM_STAGES,
     )
+
+    d_proj_weight = torch.empty_like(proj_weight)
     BLOCK_M = _ATTN_OUTPUT_PROJ_DWEIGHT_BLOCK_M
     BLOCK_DOUT = _ATTN_OUTPUT_PROJ_DWEIGHT_BLOCK_DOUT
     BLOCK_DIN = _ATTN_OUTPUT_PROJ_DWEIGHT_BLOCK_DIN
     dweight_grid = (triton.cdiv(D_out, BLOCK_DOUT), triton.cdiv(D_in, BLOCK_DIN))
-    wrap_triton(_attn_output_proj_residual_dweight_bwd_kernel)[dweight_grid](
+    wrap_triton(_attn_output_proj_dweight_bwd_kernel)[dweight_grid](
         attn_out,
         dy,
         d_proj_weight,
@@ -323,7 +341,81 @@ def _attn_output_proj_residual_bwd_impl(
         num_warps=_ATTN_OUTPUT_PROJ_DWEIGHT_NUM_WARPS,
         num_stages=_ATTN_OUTPUT_PROJ_DWEIGHT_NUM_STAGES,
     )
-    return d_attn_out, d_proj_weight
+    return d_attn_out, d_proj_weight, delta
+
+
+def _attn_output_proj_residual_fwd_impl(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    proj_weight: torch.Tensor,
+    residual: torch.Tensor,
+    window_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Run SDPA + output projection + residual forward.
+
+    Returns `(y, attn_out, lse)`. The public wrapper returns only `y`; the
+    auxiliary tensors are saved so backward can fuse output-projection delta
+    production with SDPA backward.
+    """
+    from .triton_fused_attn_sdpa import _attn_sdpa_fwd_op
+
+    assert q.ndim == k.ndim == v.ndim == 4
+    assert residual.ndim == 3
+    B, T, n_head, head_dim = q.shape
+    attn_out, lse = _attn_sdpa_fwd_op(q, k, v, window_size)
+    attn_flat = attn_out.contiguous().view(B * T, n_head * head_dim)
+    residual_flat = residual.contiguous().view(B * T, -1)
+    y_flat = _attn_output_proj_fwd_impl(
+        attn_flat,
+        proj_weight,
+        residual_flat,
+    )
+    return y_flat.view(B, T, -1), attn_out, lse
+
+
+def _attn_output_proj_residual_bwd_impl(
+    dy: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    attn_out: torch.Tensor,
+    lse: torch.Tensor,
+    proj_weight: torch.Tensor,
+    window_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Run backward for SDPA + output projection + residual.
+
+    Returns gradients for `(q, k, v, proj_weight)`. The residual gradient is
+    the direct `dy` passthrough and is returned by the autograd callback.
+    """
+    from .triton_fused_attn_sdpa import _attn_sdpa_bwd_op
+
+    B, T, n_head, head_dim = q.shape
+    dy_flat = dy.contiguous().view(B * T, -1)
+    attn_flat = attn_out.contiguous().view(B * T, n_head * head_dim)
+    d_attn_flat, d_proj_weight, delta_flat = _attn_output_proj_dattn_delta_bwd_impl(
+        dy_flat,
+        attn_flat,
+        proj_weight,
+        n_head,
+        head_dim,
+    )
+    d_attn = d_attn_flat.view(B, T, n_head, head_dim)
+    delta = delta_flat.view(B, T, n_head)
+    dq, dk, dv = _attn_sdpa_bwd_op(
+        d_attn,
+        q,
+        k,
+        v,
+        lse,
+        delta,
+        window_size,
+    )
+    return dq, dk, dv, d_proj_weight
+
+
+# ── torch.library.triton_op wrapping — visible to torch.compile ──
 
 
 @torch.library.triton_op(
@@ -331,21 +423,22 @@ def _attn_output_proj_residual_bwd_impl(
     mutates_args=(),
 )
 def _attn_output_proj_residual_fwd_op(
-    attn_out: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
     proj_weight: torch.Tensor,
     residual: torch.Tensor,
-) -> torch.Tensor:
-    """Triton-op forward wrapper.
-
-    Args:
-      attn_out: `(M, D_in)` contiguous CUDA tensor.
-      proj_weight: `(D_out, D_in)` contiguous CUDA tensor.
-      residual: `(M, D_out)` contiguous CUDA tensor.
-
-    Returns:
-      `(M, D_out)` tensor, dtype=`attn_out.dtype`.
-    """
-    return _attn_output_proj_residual_fwd_impl(attn_out, proj_weight, residual)
+    window_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Triton-op forward wrapper returning `(y, attn_out, lse)`."""
+    return _attn_output_proj_residual_fwd_impl(
+        q,
+        k,
+        v,
+        proj_weight,
+        residual,
+        window_size,
+    )
 
 
 @torch.library.triton_op(
@@ -354,53 +447,65 @@ def _attn_output_proj_residual_fwd_op(
 )
 def _attn_output_proj_residual_bwd_op(
     dy: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
     attn_out: torch.Tensor,
+    lse: torch.Tensor,
     proj_weight: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Triton-op backward wrapper.
-
-    Args:
-      dy: `(M, D_out)` output gradient.
-      attn_out: `(M, D_in)` saved forward attention output.
-      proj_weight: `(D_out, D_in)` saved projection weight.
-
-    Returns:
-      `(d_attn_out, d_proj_weight)` with shapes `(M, D_in)` and
-      `(D_out, D_in)`.
-    """
-    return _attn_output_proj_residual_bwd_impl(dy, attn_out, proj_weight)
+    window_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Triton-op backward wrapper returning `(dq, dk, dv, dW)`."""
+    return _attn_output_proj_residual_bwd_impl(
+        dy,
+        q,
+        k,
+        v,
+        attn_out,
+        lse,
+        proj_weight,
+        window_size,
+    )
 
 
 def _attn_output_proj_residual_setup_context(
     ctx: Any,
-    inputs: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-    output: torch.Tensor,
+    inputs: tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        int,
+    ],
+    output: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
 ) -> None:
-    """Save forward tensors needed by the Triton-op autograd callback."""
-    attn_out, proj_weight, _residual = inputs
-    ctx.save_for_backward(attn_out, proj_weight)
+    """Save tensors needed by the combined SDPA/output backward."""
+    q, k, v, proj_weight, _residual, window_size = inputs
+    _y, attn_out, lse = output
+    ctx.save_for_backward(q, k, v, attn_out, lse, proj_weight)
+    ctx.window_size = window_size
 
 
 def _attn_output_proj_residual_autograd_backward(
     ctx: Any,
-    grad_y: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Autograd callback for `nanoops::attn_output_proj_residual_fwd`.
-
-    Args:
-      grad_y: `(M, D_out)` gradient of public output.
-
-    Returns:
-      Gradients for `(attn_out, proj_weight, residual)`. The residual
-      gradient is the direct passthrough `grad_y`.
-    """
-    attn_out, proj_weight = ctx.saved_tensors
-    d_attn_out, d_proj_weight = _attn_output_proj_residual_bwd_op(
-        grad_y,
+    dy: torch.Tensor,
+    _d_attn_out_aux: torch.Tensor,
+    _d_lse_aux: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, None]:
+    """Backward for combined SDPA + output projection."""
+    q, k, v, attn_out, lse, proj_weight = ctx.saved_tensors
+    dq, dk, dv, d_proj_weight = _attn_output_proj_residual_bwd_op(
+        dy,
+        q,
+        k,
+        v,
         attn_out,
+        lse,
         proj_weight,
+        ctx.window_size,
     )
-    return d_attn_out, d_proj_weight, grad_y
+    return dq, dk, dv, d_proj_weight, dy, None
 
 
 _attn_output_proj_residual_fwd_op.register_autograd(
@@ -410,22 +515,40 @@ _attn_output_proj_residual_fwd_op.register_autograd(
 
 
 def attn_output_proj_residual(
-    attn_out: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
     proj_weight: torch.Tensor,
     residual: torch.Tensor,
+    window_size: int,
 ) -> torch.Tensor:
-    """Fused `y = residual + attn_out @ proj_weight.T`.
+    """Combined training attention tail: SDPA, output projection, residual.
 
     Args:
-      attn_out: `(M, D_in)` CUDA tensor, activation dtype.
-      proj_weight: `(D_out, D_in)` projection weight tensor.
-      residual: `(M, D_out)` residual stream tensor.
+      q: `(B, T, H_q, D)` contiguous CUDA query tensor.
+      k: `(B, T, H_kv, D)` contiguous CUDA key tensor.
+      v: `(B, T, H_kv, D)` contiguous CUDA value tensor.
+      proj_weight: `(C, H_q * D)` contiguous output projection weight.
+      residual: `(B, T, C)` residual stream to add after projection.
+      window_size: total visible keys per query.
 
     Returns:
-      `(M, D_out)` projected residual output, dtype=`attn_out.dtype`.
+      `(B, T, C)` tensor. Backward fuses output-projection `d_attn_out`
+      with SDPA `delta = sum(attn_out * d_attn_out)`.
     """
-    assert attn_out.ndim == proj_weight.ndim == residual.ndim == 2
-    attn_out = attn_out.contiguous()
+    assert q.ndim == k.ndim == v.ndim == 4
+    assert residual.ndim == 3
+    q = q.contiguous()
+    k = k.contiguous()
+    v = v.contiguous()
     proj_weight = proj_weight.contiguous()
     residual = residual.contiguous()
-    return _attn_output_proj_residual_fwd_op(attn_out, proj_weight, residual)
+    y, _attn_out, _lse = _attn_output_proj_residual_fwd_op(
+        q,
+        k,
+        v,
+        proj_weight,
+        residual,
+        window_size,
+    )
+    return y

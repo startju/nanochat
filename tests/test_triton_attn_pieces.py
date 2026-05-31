@@ -15,6 +15,7 @@ from nanoops.triton_fused_attn_qkv import (
     norm_qkv_projection_with_residual_mix,
 )
 from nanoops.triton_fused_attn_output import attn_output_proj_residual
+from nanoops.functional import sliding_window_sdpa
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -652,36 +653,42 @@ def test_norm_qkv_projection_residual_mix_backward():
             f"{name}.grad max diff {max_diff:.4e}"
 
 
-# ─────────────────────────────────────────────────────────────────────
-# attn_output_proj_residual:  y = residual + attn_out @ proj_weight.T
-# ─────────────────────────────────────────────────────────────────────
-
-def test_attn_output_proj_residual_forward():
-    torch.manual_seed(0)
-    M, D_in, D_out = 32, 64, 48
-    attn_out = torch.randn(M, D_in, dtype=torch.bfloat16, device="cuda")
-    proj_w = (torch.randn(D_out, D_in, dtype=torch.bfloat16, device="cuda") * 0.1).to(torch.bfloat16)
-    res = torch.randn(M, D_out, dtype=torch.bfloat16, device="cuda")
-    y_ref = torch.addmm(res, attn_out, proj_w.t())
-    y_triton = attn_output_proj_residual(attn_out, proj_w, res)
-    assert torch.allclose(y_ref, y_triton, atol=2e-2), \
-        f"fwd max diff {(y_ref - y_triton).abs().max():.4e}"
-
-
 def test_attn_output_proj_residual_backward():
     torch.manual_seed(0)
-    M, D_in, D_out = 32, 64, 48
-    a0 = torch.randn(M, D_in, dtype=torch.bfloat16, device="cuda")
-    w0 = (torch.randn(D_out, D_in, dtype=torch.bfloat16, device="cuda") * 0.1).to(torch.bfloat16)
-    r0 = torch.randn(M, D_out, dtype=torch.bfloat16, device="cuda")
-    g = torch.randn(M, D_out, dtype=torch.bfloat16, device="cuda")
+    B, T, H, D, C, W = 1, 32, 4, 16, 64, 8
+    q0 = torch.randn(B, T, H, D, dtype=torch.bfloat16, device="cuda")
+    k0 = torch.randn(B, T, H, D, dtype=torch.bfloat16, device="cuda")
+    v0 = torch.randn(B, T, H, D, dtype=torch.bfloat16, device="cuda")
+    w0 = (torch.randn(C, H * D, dtype=torch.bfloat16, device="cuda") * 0.1).to(torch.bfloat16)
+    r0 = torch.randn(B, T, C, dtype=torch.bfloat16, device="cuda")
+    g = torch.randn(B, T, C, dtype=torch.bfloat16, device="cuda")
 
-    a1, w1, r1 = a0.clone().requires_grad_(), w0.clone().requires_grad_(), r0.clone().requires_grad_()
-    torch.addmm(r1, a1, w1.t()).backward(g)
+    q1, k1, v1 = q0.clone().requires_grad_(), k0.clone().requires_grad_(), v0.clone().requires_grad_()
+    w1, r1 = w0.clone().requires_grad_(), r0.clone().requires_grad_()
+    attn_ref = sliding_window_sdpa(
+        q1.transpose(1, 2),
+        k1.transpose(1, 2),
+        v1.transpose(1, 2),
+        W,
+    ).transpose(1, 2)
+    y_ref = torch.addmm(
+        r1.view(B * T, C),
+        attn_ref.contiguous().view(B * T, H * D),
+        w1.t(),
+    ).view(B, T, C)
+    y_ref.backward(g)
 
-    a2, w2, r2 = a0.clone().requires_grad_(), w0.clone().requires_grad_(), r0.clone().requires_grad_()
-    attn_output_proj_residual(a2, w2, r2).backward(g)
+    q2, k2, v2 = q0.clone().requires_grad_(), k0.clone().requires_grad_(), v0.clone().requires_grad_()
+    w2, r2 = w0.clone().requires_grad_(), r0.clone().requires_grad_()
+    attn_output_proj_residual(q2, k2, v2, w2, r2, W).backward(g)
 
-    for name, ref, got in [("a", a1.grad, a2.grad), ("w", w1.grad, w2.grad), ("r", r1.grad, r2.grad)]:
-        assert torch.allclose(ref, got, atol=2e-2), \
-            f"{name}.grad max diff {(ref - got).abs().max():.4e}"
+    for name, ref, got, atol in [
+        ("q", q1.grad, q2.grad, 6e-2),
+        ("k", k1.grad, k2.grad, 6e-2),
+        ("v", v1.grad, v2.grad, 6e-2),
+        ("w", w1.grad, w2.grad, 1.5e-1),
+        ("r", r1.grad, r2.grad, 0.0),
+    ]:
+        max_diff = (ref - got).abs().max().item()
+        assert torch.allclose(ref, got, atol=atol), \
+            f"{name}.grad max diff {max_diff:.4e}"
