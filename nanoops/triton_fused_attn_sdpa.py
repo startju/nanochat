@@ -44,10 +44,6 @@ def _pick_gqa_block_m(block_m: int, gqa_group: int) -> int:
     return max(8, block_m // gqa_group)
 
 
-def _next_power_of_2(value: int) -> int:
-    return 1 << (value - 1).bit_length()
-
-
 # ─────────────────────────────────────────────────────────────────────
 # Flash-style sliding-window SDPA in Triton.
 #
@@ -129,15 +125,15 @@ if _HAS_TRITON:
         WINDOW: tl.constexpr,
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
-        BLOCK_HM: tl.constexpr,
         M_TILES: tl.constexpr,
         GQA_GROUP: tl.constexpr,
         D: tl.constexpr,
     ):
         """GQA forward: one program per (batch × Q-tile × K/V head).
 
-        `BLOCK_HM` flattens `(GQA_GROUP, BLOCK_M)`, so one K/V tile feeds all
-        query heads that share the same K/V head. With non-GQA, GQA_GROUP=1.
+        `GQA_GROUP * BLOCK_M` flattens `(GQA_GROUP, BLOCK_M)`, so one K/V
+        tile feeds all query heads that share the same K/V head. With
+        non-GQA, GQA_GROUP=1.
         """
         pid_bm = tl.program_id(0)
         kv_hid = tl.program_id(1)
@@ -150,7 +146,7 @@ if _HAS_TRITON:
         batch_q_base = bid * M * H_Q * D
         batch_k_base = bid * N * H_KV * D
         batch_lse_base = bid * M * H_Q
-        offs_hm = tl.arange(0, BLOCK_HM)
+        offs_hm = tl.arange(0, GQA_GROUP * BLOCK_M)
         head_off = offs_hm // BLOCK_M
         row_in_tile = offs_hm - head_off * BLOCK_M
         offs_m = pid_m * BLOCK_M + row_in_tile
@@ -173,9 +169,9 @@ if _HAS_TRITON:
         )
         q = tl.load(q_ptrs, mask=hm_mask[:, None], other=0.0)
 
-        m_i = tl.full((BLOCK_HM,), -float("inf"), dtype=tl.float32)
-        l_i = tl.zeros((BLOCK_HM,), dtype=tl.float32)
-        acc = tl.zeros((BLOCK_HM, D), dtype=tl.float32)
+        m_i = tl.full((GQA_GROUP * BLOCK_M,), -float("inf"), dtype=tl.float32)
+        l_i = tl.zeros((GQA_GROUP * BLOCK_M,), dtype=tl.float32)
+        acc = tl.zeros((GQA_GROUP * BLOCK_M, D), dtype=tl.float32)
 
         offs_n_base = tl.arange(0, BLOCK_N)
         for kv_idx in range(kv_tile_start, kv_tile_end):
@@ -294,7 +290,6 @@ if _HAS_TRITON:
         WINDOW: tl.constexpr,
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
-        BLOCK_HM: tl.constexpr,
         M_TILES: tl.constexpr,
         GQA_GROUP: tl.constexpr,
         D: tl.constexpr,
@@ -302,15 +297,16 @@ if _HAS_TRITON:
         """Compute dQ for one `(batch, Q-tile, K/V head)`.
 
         Like the forward path, this flattens `(GQA_GROUP, BLOCK_M)` into the
-        Q-row tile so one K/V tile feeds all Q heads sharing it. dK/dV are
-        computed in a separate K/V-owned pass to avoid atomics.
+        Q-row tile via `GQA_GROUP * BLOCK_M`, so one K/V tile feeds all Q heads
+        sharing it. dK/dV are computed in a separate K/V-owned pass to avoid
+        atomics.
         """
         pid_bm = tl.program_id(0)
         kv_hid = tl.program_id(1)
         bid = pid_bm // M_TILES
         pid_m = pid_bm - bid * M_TILES
 
-        offs_hm = tl.arange(0, BLOCK_HM)
+        offs_hm = tl.arange(0, GQA_GROUP * BLOCK_M)
         head_off = offs_hm // BLOCK_M
         row_in_tile = offs_hm - head_off * BLOCK_M
         offs_m = pid_m * BLOCK_M + row_in_tile
@@ -351,7 +347,7 @@ if _HAS_TRITON:
         do = tl.load(do_ptrs, mask=hm_mask[:, None], other=0.0)
         lse = tl.load(lse_ptrs, mask=hm_mask, other=0.0)
         d_row = tl.load(d_ptrs, mask=hm_mask, other=0.0)
-        dq_acc = tl.zeros((BLOCK_HM, D), dtype=tl.float32)
+        dq_acc = tl.zeros((GQA_GROUP * BLOCK_M, D), dtype=tl.float32)
 
         offs_n_base = tl.arange(0, BLOCK_N)
         for kv_idx in range(kv_tile_start, kv_tile_end):
@@ -418,7 +414,6 @@ if _HAS_TRITON:
         WINDOW: tl.constexpr,
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
-        BLOCK_HM: tl.constexpr,
         N_TILES: tl.constexpr,
         GQA_GROUP: tl.constexpr,
         D: tl.constexpr,
@@ -468,7 +463,7 @@ if _HAS_TRITON:
         q_high = tl.minimum(M, kv_start + BLOCK_N + WINDOW - 1)
         q_tile_end = (q_high + BLOCK_M - 1) // BLOCK_M
 
-        offs_hm = tl.arange(0, BLOCK_HM)
+        offs_hm = tl.arange(0, GQA_GROUP * BLOCK_M)
         head_off = offs_hm // BLOCK_M
         row_in_tile = offs_hm - head_off * BLOCK_M
         hid = kv_hid * GQA_GROUP + head_off
@@ -577,7 +572,6 @@ def _flash_sdpa_fwd_impl(
     # prioritizes batch/row tiles on axis 0 and uses axis 1 for heads.
     block_m, block_n, num_warps, num_stages = _pick_sdpa_fwd_tile_config(D)
     segment_block_m = _pick_gqa_block_m(block_m, gqa_group)
-    segment_block_hm = _next_power_of_2(segment_block_m * gqa_group)
     m_tiles = triton.cdiv(M, segment_block_m)
     grid = (B * m_tiles, h_kv)
     wrap_triton(_flash_attn_fwd_gqa_kernel)[grid](
@@ -595,7 +589,6 @@ def _flash_sdpa_fwd_impl(
         WINDOW=window_size,
         BLOCK_M=segment_block_m,
         BLOCK_N=block_n,
-        BLOCK_HM=segment_block_hm,
         M_TILES=m_tiles,
         GQA_GROUP=gqa_group,
         D=D,
@@ -666,7 +659,6 @@ def _flash_sdpa_bwd_impl(
     dk = torch.empty_like(k)
     dv = torch.empty_like(v)
     segment_block_m = _pick_gqa_block_m(block_m, gqa_group)
-    segment_block_hm = _next_power_of_2(segment_block_m * gqa_group)
     m_tiles = triton.cdiv(M, segment_block_m)
     grid_dq = (B * m_tiles, h_kv)
     wrap_triton(_flash_attn_bwd_dq_gqa_kernel)[grid_dq](
@@ -686,7 +678,6 @@ def _flash_sdpa_bwd_impl(
         WINDOW=window_size,
         BLOCK_M=segment_block_m,
         BLOCK_N=block_n,
-        BLOCK_HM=segment_block_hm,
         M_TILES=m_tiles,
         GQA_GROUP=gqa_group,
         D=D,
@@ -713,7 +704,6 @@ def _flash_sdpa_bwd_impl(
         WINDOW=window_size,
         BLOCK_M=segment_block_m,
         BLOCK_N=block_n,
-        BLOCK_HM=segment_block_hm,
         N_TILES=n_tiles,
         GQA_GROUP=gqa_group,
         D=D,
