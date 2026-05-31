@@ -51,7 +51,7 @@ from .triton_fused_mlp_block import (
 
 # ── Attention-side kernels ──────────────────────────────────────────
 from .triton_fused_attn_output import (
-    output_proj_residual,
+    attn_output_proj_residual,
 )
 from .triton_fused_attn_qkv import (
     _norm_qkv_projection_bwd_impl,

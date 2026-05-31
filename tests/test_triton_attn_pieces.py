@@ -14,8 +14,8 @@ from nanoops.triton_fused_attn_qkv import (
     _norm_qkv_projection_bwd_impl,
 )
 from nanoops.triton_kernels import (
+    attn_output_proj_residual,
     norm_qkv_projection_with_residual_mix,
-    output_proj_residual,
 )
 
 
@@ -655,22 +655,22 @@ def test_norm_qkv_projection_residual_mix_backward():
 
 
 # ─────────────────────────────────────────────────────────────────────
-# output_proj_residual:  y = residual + attn_out @ proj_weight.T
+# attn_output_proj_residual:  y = residual + attn_out @ proj_weight.T
 # ─────────────────────────────────────────────────────────────────────
 
-def test_output_proj_residual_forward():
+def test_attn_output_proj_residual_forward():
     torch.manual_seed(0)
     M, D_in, D_out = 32, 64, 48
     attn_out = torch.randn(M, D_in, dtype=torch.bfloat16, device="cuda")
     proj_w = (torch.randn(D_out, D_in, dtype=torch.bfloat16, device="cuda") * 0.1).to(torch.bfloat16)
     res = torch.randn(M, D_out, dtype=torch.bfloat16, device="cuda")
     y_ref = torch.addmm(res, attn_out, proj_w.t())
-    y_triton = output_proj_residual(attn_out, proj_w, res)
+    y_triton = attn_output_proj_residual(attn_out, proj_w, res)
     assert torch.allclose(y_ref, y_triton, atol=2e-2), \
         f"fwd max diff {(y_ref - y_triton).abs().max():.4e}"
 
 
-def test_output_proj_residual_backward():
+def test_attn_output_proj_residual_backward():
     torch.manual_seed(0)
     M, D_in, D_out = 32, 64, 48
     a0 = torch.randn(M, D_in, dtype=torch.bfloat16, device="cuda")
@@ -682,7 +682,7 @@ def test_output_proj_residual_backward():
     torch.addmm(r1, a1, w1.t()).backward(g)
 
     a2, w2, r2 = a0.clone().requires_grad_(), w0.clone().requires_grad_(), r0.clone().requires_grad_()
-    output_proj_residual(a2, w2, r2).backward(g)
+    attn_output_proj_residual(a2, w2, r2).backward(g)
 
     for name, ref, got in [("a", a1.grad, a2.grad), ("w", w1.grad, w2.grad), ("r", r1.grad, r2.grad)]:
         assert torch.allclose(ref, got, atol=2e-2), \

@@ -1,6 +1,6 @@
 """Attention output Triton kernels for nanoops.
 
-Contains `output_proj_residual` (c_proj + residual), re-exported through
+Contains `attn_output_proj_residual` (c_proj + residual), re-exported through
 `nanoops.triton_kernels`.
 """
 
@@ -30,9 +30,26 @@ except ImportError:
 # ─────────────────────────────────────────────────────────────────────
 
 if _HAS_TRITON:
+    _ATTN_OUTPUT_PROJ_FWD_BLOCK_M = 64
+    _ATTN_OUTPUT_PROJ_FWD_BLOCK_DOUT = 128
+    _ATTN_OUTPUT_PROJ_FWD_BLOCK_DIN = 32
+    _ATTN_OUTPUT_PROJ_FWD_NUM_WARPS = 8
+    _ATTN_OUTPUT_PROJ_FWD_NUM_STAGES = 3
+
+    _ATTN_OUTPUT_PROJ_DATTN_BLOCK_M = 64
+    _ATTN_OUTPUT_PROJ_DATTN_BLOCK_DOUT = 32
+    _ATTN_OUTPUT_PROJ_DATTN_BLOCK_DIN = 128
+    _ATTN_OUTPUT_PROJ_DATTN_NUM_WARPS = 8
+    _ATTN_OUTPUT_PROJ_DATTN_NUM_STAGES = 3
+
+    _ATTN_OUTPUT_PROJ_DWEIGHT_BLOCK_M = 64
+    _ATTN_OUTPUT_PROJ_DWEIGHT_BLOCK_DOUT = 128
+    _ATTN_OUTPUT_PROJ_DWEIGHT_BLOCK_DIN = 64
+    _ATTN_OUTPUT_PROJ_DWEIGHT_NUM_WARPS = 8
+    _ATTN_OUTPUT_PROJ_DWEIGHT_NUM_STAGES = 1
 
     @triton.jit
-    def _output_proj_residual_kernel(
+    def _attn_output_proj_residual_fwd_kernel(
         attn_out_ptr,  # (M, D_in) — in: attention output
         proj_w_ptr,  # (D_out, D_in) — in: output projection weight
         residual_ptr,  # (M, D_out) — in: residual stream
@@ -87,7 +104,7 @@ if _HAS_TRITON:
         tl.store(y_ptrs, y, mask=out_mask)
 
     @triton.jit
-    def _output_proj_residual_dattn_bwd_kernel(
+    def _attn_output_proj_residual_dattn_bwd_kernel(
         proj_w_ptr,  # (D_out, D_in) — in: projection weight
         dy_ptr,  # (M, D_out) — in: output gradient
         d_attn_out_ptr,  # (M, D_in) — out: dy @ proj_weight
@@ -135,7 +152,7 @@ if _HAS_TRITON:
         )
 
     @triton.jit
-    def _output_proj_residual_dweight_bwd_kernel(
+    def _attn_output_proj_residual_dweight_bwd_kernel(
         attn_out_ptr,  # (M, D_in) — in: forward attention output
         dy_ptr,  # (M, D_out) — in: output gradient
         d_proj_w_ptr,  # (D_out, D_in) — out: dy.T @ attn_out
@@ -177,7 +194,7 @@ if _HAS_TRITON:
         )
 
 
-def _output_proj_residual_fwd_impl(
+def _attn_output_proj_residual_fwd_impl(
     attn_out: torch.Tensor,
     proj_weight: torch.Tensor,
     residual: torch.Tensor,
@@ -193,7 +210,7 @@ def _output_proj_residual_fwd_impl(
       (M, D_out) projected residual output.
     """
     if not _HAS_TRITON:
-        raise RuntimeError("output_proj_residual requires triton")
+        raise RuntimeError("attn_output_proj_residual requires triton")
     assert attn_out.is_cuda and proj_weight.is_cuda and residual.is_cuda
     assert attn_out.is_contiguous() and proj_weight.is_contiguous() and residual.is_contiguous()
     assert attn_out.ndim == proj_weight.ndim == residual.ndim == 2
@@ -203,9 +220,11 @@ def _output_proj_residual_fwd_impl(
     assert M == M_res and D_in == D_in_w and D_out == D_out_w
 
     y = torch.empty((M, D_out), dtype=attn_out.dtype, device=attn_out.device)
-    BLOCK_M, BLOCK_DOUT, BLOCK_DIN = 32, 64, 32
+    BLOCK_M = _ATTN_OUTPUT_PROJ_FWD_BLOCK_M
+    BLOCK_DOUT = _ATTN_OUTPUT_PROJ_FWD_BLOCK_DOUT
+    BLOCK_DIN = _ATTN_OUTPUT_PROJ_FWD_BLOCK_DIN
     grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(D_out, BLOCK_DOUT))
-    wrap_triton(_output_proj_residual_kernel)[grid](
+    wrap_triton(_attn_output_proj_residual_fwd_kernel)[grid](
         attn_out,
         proj_weight,
         residual,
@@ -216,11 +235,13 @@ def _output_proj_residual_fwd_impl(
         BLOCK_M=BLOCK_M,
         BLOCK_DOUT=BLOCK_DOUT,
         BLOCK_DIN=BLOCK_DIN,
+        num_warps=_ATTN_OUTPUT_PROJ_FWD_NUM_WARPS,
+        num_stages=_ATTN_OUTPUT_PROJ_FWD_NUM_STAGES,
     )
     return y
 
 
-def _output_proj_residual_bwd_impl(
+def _attn_output_proj_residual_bwd_impl(
     dy: torch.Tensor,
     attn_out: torch.Tensor,
     proj_weight: torch.Tensor,
@@ -237,7 +258,7 @@ def _output_proj_residual_bwd_impl(
       d_proj_weight: (D_out, D_in), `dy.T @ attn_out`.
     """
     if not _HAS_TRITON:
-        raise RuntimeError("output_proj_residual backward requires triton")
+        raise RuntimeError("attn_output_proj_residual backward requires triton")
     dy = dy.contiguous()
     assert dy.is_cuda and attn_out.is_cuda and proj_weight.is_cuda
     assert dy.is_contiguous() and attn_out.is_contiguous() and proj_weight.is_contiguous()
@@ -248,9 +269,11 @@ def _output_proj_residual_bwd_impl(
 
     d_attn_out = torch.empty_like(attn_out)
     d_proj_weight = torch.empty_like(proj_weight)
-    BLOCK_M, BLOCK_DOUT, BLOCK_DIN = 32, 64, 32
+    BLOCK_M = _ATTN_OUTPUT_PROJ_DATTN_BLOCK_M
+    BLOCK_DOUT = _ATTN_OUTPUT_PROJ_DATTN_BLOCK_DOUT
+    BLOCK_DIN = _ATTN_OUTPUT_PROJ_DATTN_BLOCK_DIN
     dattn_grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(D_in, BLOCK_DIN))
-    wrap_triton(_output_proj_residual_dattn_bwd_kernel)[dattn_grid](
+    wrap_triton(_attn_output_proj_residual_dattn_bwd_kernel)[dattn_grid](
         proj_weight,
         dy,
         d_attn_out,
@@ -260,9 +283,14 @@ def _output_proj_residual_bwd_impl(
         BLOCK_M=BLOCK_M,
         BLOCK_DOUT=BLOCK_DOUT,
         BLOCK_DIN=BLOCK_DIN,
+        num_warps=_ATTN_OUTPUT_PROJ_DATTN_NUM_WARPS,
+        num_stages=_ATTN_OUTPUT_PROJ_DATTN_NUM_STAGES,
     )
+    BLOCK_M = _ATTN_OUTPUT_PROJ_DWEIGHT_BLOCK_M
+    BLOCK_DOUT = _ATTN_OUTPUT_PROJ_DWEIGHT_BLOCK_DOUT
+    BLOCK_DIN = _ATTN_OUTPUT_PROJ_DWEIGHT_BLOCK_DIN
     dweight_grid = (triton.cdiv(D_out, BLOCK_DOUT), triton.cdiv(D_in, BLOCK_DIN))
-    wrap_triton(_output_proj_residual_dweight_bwd_kernel)[dweight_grid](
+    wrap_triton(_attn_output_proj_residual_dweight_bwd_kernel)[dweight_grid](
         attn_out,
         dy,
         d_proj_weight,
@@ -272,37 +300,39 @@ def _output_proj_residual_bwd_impl(
         BLOCK_M=BLOCK_M,
         BLOCK_DOUT=BLOCK_DOUT,
         BLOCK_DIN=BLOCK_DIN,
+        num_warps=_ATTN_OUTPUT_PROJ_DWEIGHT_NUM_WARPS,
+        num_stages=_ATTN_OUTPUT_PROJ_DWEIGHT_NUM_STAGES,
     )
     return d_attn_out, d_proj_weight
 
 
 @torch.library.triton_op(
-    "nanoops::output_proj_residual_fwd",
+    "nanoops::attn_output_proj_residual_fwd",
     mutates_args=(),
 )
-def _output_proj_residual_fwd_op(
+def _attn_output_proj_residual_fwd_op(
     attn_out: torch.Tensor,
     proj_weight: torch.Tensor,
     residual: torch.Tensor,
 ) -> torch.Tensor:
     """Triton-op forward wrapper for output projection + residual add."""
-    return _output_proj_residual_fwd_impl(attn_out, proj_weight, residual)
+    return _attn_output_proj_residual_fwd_impl(attn_out, proj_weight, residual)
 
 
 @torch.library.triton_op(
-    "nanoops::output_proj_residual_bwd",
+    "nanoops::attn_output_proj_residual_bwd",
     mutates_args=(),
 )
-def _output_proj_residual_bwd_op(
+def _attn_output_proj_residual_bwd_op(
     dy: torch.Tensor,
     attn_out: torch.Tensor,
     proj_weight: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Triton-op backward wrapper returning `(d_attn_out, d_proj_weight)`."""
-    return _output_proj_residual_bwd_impl(dy, attn_out, proj_weight)
+    return _attn_output_proj_residual_bwd_impl(dy, attn_out, proj_weight)
 
 
-def _output_proj_residual_setup_context(
+def _attn_output_proj_residual_setup_context(
     ctx: Any,
     inputs: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
     output: torch.Tensor,
@@ -312,13 +342,13 @@ def _output_proj_residual_setup_context(
     ctx.save_for_backward(attn_out, proj_weight)
 
 
-def _output_proj_residual_autograd_backward(
+def _attn_output_proj_residual_autograd_backward(
     ctx: Any,
     grad_y: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Autograd callback for `nanoops::output_proj_residual_fwd`."""
+    """Autograd callback for `nanoops::attn_output_proj_residual_fwd`."""
     attn_out, proj_weight = ctx.saved_tensors
-    d_attn_out, d_proj_weight = _output_proj_residual_bwd_op(
+    d_attn_out, d_proj_weight = _attn_output_proj_residual_bwd_op(
         grad_y,
         attn_out,
         proj_weight,
@@ -326,13 +356,13 @@ def _output_proj_residual_autograd_backward(
     return d_attn_out, d_proj_weight, grad_y
 
 
-_output_proj_residual_fwd_op.register_autograd(
-    _output_proj_residual_autograd_backward,
-    setup_context=_output_proj_residual_setup_context,
+_attn_output_proj_residual_fwd_op.register_autograd(
+    _attn_output_proj_residual_autograd_backward,
+    setup_context=_attn_output_proj_residual_setup_context,
 )
 
 
-def output_proj_residual(
+def attn_output_proj_residual(
     attn_out: torch.Tensor,
     proj_weight: torch.Tensor,
     residual: torch.Tensor,
@@ -351,4 +381,4 @@ def output_proj_residual(
     attn_out = attn_out.contiguous()
     proj_weight = proj_weight.contiguous()
     residual = residual.contiguous()
-    return _output_proj_residual_fwd_op(attn_out, proj_weight, residual)
+    return _attn_output_proj_residual_fwd_op(attn_out, proj_weight, residual)
