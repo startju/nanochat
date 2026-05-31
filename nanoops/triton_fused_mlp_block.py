@@ -2,8 +2,6 @@
 as `y = x + relu²(norm(x) @ W_fc.T) @ W_proj.T`, with 3 fwd
 steps + 4 bwd steps in Triton. See `fused_mlp_block` and TRITON_zh.md
 Chapter 3.
-
-Re-exported through `nanoops.triton_kernels` for backward-compat callers.
 """
 
 from __future__ import annotations

@@ -10,8 +10,8 @@ triton = pytest.importorskip("triton")
 if not torch.cuda.is_available():
     pytest.skip("triton kernels require CUDA", allow_module_level=True)
 
-from nanoops.triton_kernels import flash_sdpa
 from nanoops.functional import sliding_window_sdpa
+from nanoops.triton_fused_attn_sdpa import flash_sdpa
 
 
 @pytest.mark.parametrize("B,H,L,D,W", [

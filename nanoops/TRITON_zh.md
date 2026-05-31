@@ -8,8 +8,7 @@ block size 是怎么按 3090 真实预算选出来的、fusion 边界为什么�
 
 文档从最底层的硬件数字（SM 数、shared mem、register file）出发，一层
 层往上推到 fused kernel 设计。读完后回头看按功能拆分的 Triton 模块里
-任何一个 kernel，你都能讲清楚每个选择背后的理由。`triton_kernels.py`
-现在只是向后兼容的 re-export shim。
+任何一个 kernel，你都能讲清楚每个选择背后的理由。
 
 > English version: [TRITON.md](TRITON.md)
 

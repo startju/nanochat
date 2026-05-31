@@ -241,7 +241,7 @@ def _attn_qkv_residual(
     window = window_size[0]
     sdpa_window = T if (window < 0 or window >= T) else window + 1
     if _use_flash_sdpa_for_window(sdpa_window, T):
-        from .triton_kernels import flash_sdpa as _triton_flash_sdpa
+        from .triton_fused_attn_sdpa import flash_sdpa as _triton_flash_sdpa
 
         y = _triton_flash_sdpa(q, k, v, sdpa_window)
     else:
@@ -279,7 +279,7 @@ def _training_flash_sdpa_bhmd(
     """
     if not (q.is_cuda and k.is_cuda and v.is_cuda):
         raise RuntimeError("Triton flash_sdpa training path requires CUDA tensors")
-    from .triton_kernels import flash_sdpa as _triton_flash_sdpa
+    from .triton_fused_attn_sdpa import flash_sdpa as _triton_flash_sdpa
 
     out = _triton_flash_sdpa(
         q.transpose(1, 2).contiguous(),
@@ -581,7 +581,7 @@ def _apply() -> dict[str, dict]:
     # See nanoops/TRITON_zh.md §3 for the fusion breakdown. Supersedes
     # the relu_square fusion (which is a subset of what's fused here).
     if os.environ.get("NANOOPS_FUSED_MLP_BLOCK"):
-        from .triton_kernels import fused_mlp_block as _fmb
+        from .triton_fused_mlp_block import fused_mlp_block as _fmb
 
         assert _orig_norm is None, "_orig_norm already captured — call _restore() first"
         _orig_norm = gpt_mod.norm
@@ -595,8 +595,8 @@ def _apply() -> dict[str, dict]:
     # the fused op owns the outer RMSNorm that nanchat applies one level up in
     # Block.forward, and it needs token ids + VE table to fuse value embedding.
     if os.environ.get("NANOOPS_FUSED_ATTN_QKV"):
-        from .triton_kernels import attn_output_proj_residual as _aopr
-        from .triton_kernels import norm_qkv_projection_with_residual_mix as _nqp
+        from .triton_fused_attn_output import attn_output_proj_residual as _aopr
+        from .triton_fused_attn_qkv import norm_qkv_projection_with_residual_mix as _nqp
 
         assert _orig_gpt_forward is None, (
             "_orig_gpt_forward already captured — call _restore() before _apply()"

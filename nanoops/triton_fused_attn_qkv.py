@@ -5,7 +5,6 @@ Contains:
     no-affine outer RMSNorm, Q/K/V projection, Q/K rotary + QK RMSNorm,
     and optional gated value-embedding lookup. Backward is implemented with
     Triton kernels, including optional value-embedding gate gradients.
-Re-exported through `nanoops.triton_kernels`.
 """
 
 from __future__ import annotations

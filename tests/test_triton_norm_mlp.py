@@ -11,7 +11,7 @@ triton = pytest.importorskip("triton")
 if not torch.cuda.is_available():
     pytest.skip("triton kernels require CUDA", allow_module_level=True)
 
-from nanoops.triton_kernels import fused_mlp_block
+from nanoops.triton_fused_mlp_block import fused_mlp_block
 
 
 def _reference(x, W_fc, W_proj, eps=1e-6):

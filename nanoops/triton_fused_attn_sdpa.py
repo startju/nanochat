@@ -1,7 +1,6 @@
 """Attention SDPA-side Triton kernels for nanoops.
 
-Contains `flash_sdpa`: Flash-style sliding-causal SDPA with a split
-backward. Re-exported through `nanoops.triton_kernels`.
+Contains `flash_sdpa`: Flash-style sliding-causal SDPA with a split backward.
 """
 
 from __future__ import annotations

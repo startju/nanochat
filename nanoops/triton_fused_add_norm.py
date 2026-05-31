@@ -12,8 +12,6 @@ here:
     reused with HAS_RESIDUAL=False).
   - `triton_fused_attn_qkv.py` reuses the forward RMSNorm materialization
     path, while keeping its own RMSNorm backward helper.
-
-Re-exported through `nanoops.triton_kernels` for backward-compat callers.
 """
 
 from __future__ import annotations

@@ -12,11 +12,9 @@ if not torch.cuda.is_available():
 from nanoops.triton_fused_attn_qkv import (
     _norm_qkv_projection_residual_mix_fwd_op,
     _norm_qkv_projection_bwd_impl,
-)
-from nanoops.triton_kernels import (
-    attn_output_proj_residual,
     norm_qkv_projection_with_residual_mix,
 )
+from nanoops.triton_fused_attn_output import attn_output_proj_residual
 
 
 # ─────────────────────────────────────────────────────────────────────

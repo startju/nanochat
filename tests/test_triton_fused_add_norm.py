@@ -7,8 +7,7 @@ triton = pytest.importorskip("triton")
 if not torch.cuda.is_available():
     pytest.skip("triton kernels require CUDA", allow_module_level=True)
 
-from nanoops.triton_fused_add_norm import _pick_tile_config
-from nanoops.triton_kernels import fused_add_norm
+from nanoops.triton_fused_add_norm import _pick_tile_config, fused_add_norm
 
 
 def _reference(x, residual, nw, eps=1e-6):

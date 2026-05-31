@@ -1,7 +1,6 @@
 """Attention output Triton kernels for nanoops.
 
-Contains `attn_output_proj_residual` (c_proj + residual), re-exported through
-`nanoops.triton_kernels`.
+Contains `attn_output_proj_residual` (c_proj + residual).
 """
 
 from __future__ import annotations

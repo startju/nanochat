@@ -11,8 +11,7 @@ by the same arithmetic-intensity tradeoffs.
 The doc starts from raw hardware numbers (SM count, shared mem,
 register file) and works up to fused-kernel design. By the end you
 should be able to read any kernel in the feature-split Triton modules
-and see why every choice was made. `triton_kernels.py` is now only the
-backward-compatible re-export shim.
+and see why every choice was made.
 
 > 中文版：[TRITON_zh.md](TRITON_zh.md)
 
