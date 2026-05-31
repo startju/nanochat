@@ -223,11 +223,6 @@ def _attn_qkv_residual(
     return _fused_attn_tail(q, k, v, attn.c_proj.weight, x_mix, sdpa_window)
 
 
-def _attn_native_residual(self, x, ve, cos_sin, window_size):
-    """Attention residual matching the non-QKV-fused Block.forward path."""
-    return x + self.attn(_rms_norm_no_weight(x), ve, cos_sin, window_size, None)
-
-
 def _mlp_residual(self, x):
     if _fused_mlp is None:
         return x + self.mlp(_rms_norm_no_weight(x))
@@ -275,7 +270,6 @@ def _patched_gpt_forward(self, idx, targets=None, kv_cache=None, loss_reduction=
     n_layer = self.config.n_layer
     backout_layer = n_layer // 2
     x_backout = None
-    qkv_mode = os.environ.get("NANOOPS_FUSED_ATTN_QKV_MODE", "all")
     for i, block in enumerate(self.transformer.h):
         resid_scale = self.resid_lambdas[i]
         x0_scale = self.x0_lambdas[i]
@@ -284,47 +278,33 @@ def _patched_gpt_forward(self, idx, targets=None, kv_cache=None, loss_reduction=
             if str(i) in self.value_embeds
             else None
         )
-        use_fused_qkv = (
-            qkv_mode == "all"
-            or (qkv_mode == "ve" and ve_weight is not None)
-            or (qkv_mode == "no_ve" and ve_weight is None)
-        )
         is_full_attn = self.window_sizes[i][0] < 0 or self.window_sizes[i][0] >= T
-        if use_fused_qkv:
-            if os.environ.get("NANOOPS_L_ATTN_CHECKPOINT") and is_full_attn:
-                x = _ckpt.checkpoint(
-                    _attn_qkv_residual,
-                    block,
-                    x,
-                    x0,
-                    resid_scale,
-                    x0_scale,
-                    idx if ve_weight is not None else None,
-                    ve_weight,
-                    cos_sin,
-                    self.window_sizes[i],
-                    use_reentrant=False,
-                )
-            else:
-                x = _attn_qkv_residual(
-                    block,
-                    x,
-                    x0,
-                    resid_scale,
-                    x0_scale,
-                    idx if ve_weight is not None else None,
-                    ve_weight,
-                    cos_sin,
-                    self.window_sizes[i],
-                )
-        else:
-            ve = (
-                self.value_embeds[str(i)](idx).to(x.dtype)
-                if ve_weight is not None
-                else None
+        if os.environ.get("NANOOPS_L_ATTN_CHECKPOINT") and is_full_attn:
+            x = _ckpt.checkpoint(
+                _attn_qkv_residual,
+                block,
+                x,
+                x0,
+                resid_scale,
+                x0_scale,
+                idx if ve_weight is not None else None,
+                ve_weight,
+                cos_sin,
+                self.window_sizes[i],
+                use_reentrant=False,
             )
-            x = resid_scale * x + x0_scale * x0
-            x = _attn_native_residual(block, x, ve, cos_sin, self.window_sizes[i])
+        else:
+            x = _attn_qkv_residual(
+                block,
+                x,
+                x0,
+                resid_scale,
+                x0_scale,
+                idx if ve_weight is not None else None,
+                ve_weight,
+                cos_sin,
+                self.window_sizes[i],
+            )
         x = _mlp_residual(block, x)
         if i == backout_layer:
             x_backout = x

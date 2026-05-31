@@ -7,6 +7,8 @@
 #
 # Usage:
 #   bash nanoops/train.sh                       # defaults below
+#   bash nanoops/train.sh fuse                  # full fuse, no activation checkpoints
+#   NANOOPS_TRAIN_PATH=fuse bash nanoops/train.sh
 #   bash nanoops/train.sh --num-iterations=10   # pass extra args through
 #   NPROC=4 bash nanoops/train.sh               # override GPU count
 #   WANDB_RUN=myrun bash nanoops/train.sh       # enable wandb logging
@@ -24,13 +26,13 @@ export NANOCHAT_BASE_DIR="${NANOCHAT_BASE_DIR:-$HOME/.cache/nanochat}"
 # Note: PYTORCH_ALLOC_CONF=expandable_segments:True is set by
 # scripts/base_train.py (line 15) before any CUDA call, so we don't
 # re-export it here.
-# MLP activation checkpoint ON by default — at B=4 it saves ~3.7 GiB of
-# MLP intermediate activations (relu output + relu² output + the
-# c_fc/c_proj Mm input ctxs) for a +7% wall-time cost (one extra MLP
-# forward in backward). Cost: 0.62 s/GiB freed, strictly better than
-# ATTN checkpoint's 0.96 s/GiB. The freed headroom is what lets larger
-# --depth runs fit on a 24 GiB card. Opt out by unsetting before bash.
-export NANOOPS_MLP_CHECKPOINT="${NANOOPS_MLP_CHECKPOINT:-1}"
+
+TRAIN_PATH=${NANOOPS_TRAIN_PATH:-default}
+if [ "${1:-}" = "default" ] || [ "${1:-}" = "fuse" ]; then
+    TRAIN_PATH=$1
+    shift
+fi
+
 # Optimizer CPU offload ON by default — moves DistMuonAdamW's per-rank
 # Muon + AdamW state (~2.5 GB + ~300 MB on d24 under ZeRO-1) to CPU
 # pinned memory; H2D/D2H per optimizer step adds ~0.4% wall time but
@@ -39,31 +41,49 @@ export NANOOPS_MLP_CHECKPOINT="${NANOOPS_MLP_CHECKPOINT:-1}"
 # to escape that exact 21.58 GiB allocated + 1.35 GiB fragmentation
 # pattern). Opt out with empty value.
 export NANOOPS_OFFLOAD_OPTIM="${NANOOPS_OFFLOAD_OPTIM:-1}"
-# L-layer (full-attention) activation checkpoint ON by default. The 18
-# sliding S layers already use LSE-only chunked SDPA so their ctx is
-# small; the 6 full-attention L layers per d24-SSSL group keep more
-# activation memory and benefit most from re-running their forward in
-# backward. Combined with MLP_CHECKPOINT this is the last activation
-# trick needed to fit d24+B=1 on a single 24 GiB GPU. Opt out with
-# empty value.
-export NANOOPS_L_ATTN_CHECKPOINT="${NANOOPS_L_ATTN_CHECKPOINT:-1}"
-# FusedMLP ON by default — swaps `nanchat.gpt.Block.forward`'s
-# `x + mlp(norm(x))` path with a single autograd.Function that runs the
-# whole RMSNorm + c_fc + relu² + c_proj + residual in 3 fused Triton
-# kernels fwd / 4 fused Triton kernels bwd (no cuBLAS). All weight casts
-# are folded into the matmul kernels, dW lands directly on fp32 master.
-# d24+B=1 on 3090 measured ~+2.6% tok/s vs the eager mlp path with full
-# loss parity at 5-step resume; full op-level micro-bench is ~+9% but
-# torch.compile black-box dilutes that. Opt out with empty value.
-# CPU / kv-cache fallback already wired in _patched_block_forward.
-export NANOOPS_FUSED_MLP="${NANOOPS_FUSED_MLP:-1}"
-# Fused attention QKV ON by default — swaps the training trunk through
-# GPT.forward so outer RMSNorm + Q/K/V projection + rotary + QK norm + VE
-# lookup run in the custom Triton op. Empty value disables it for A/B runs.
-export NANOOPS_FUSED_ATTN_QKV="${NANOOPS_FUSED_ATTN_QKV-1}"
+
+case "$TRAIN_PATH" in
+    default)
+        # Checkpoint-heavy d24 path. This keeps the historical defaults:
+        # fused kernels are enabled, and activation checkpointing is on to
+        # maximize memory headroom on 24 GiB cards.
+        export NANOOPS_MLP_CHECKPOINT="${NANOOPS_MLP_CHECKPOINT:-1}"
+        export NANOOPS_L_ATTN_CHECKPOINT="${NANOOPS_L_ATTN_CHECKPOINT:-1}"
+        export NANOOPS_FUSED_MLP="${NANOOPS_FUSED_MLP:-1}"
+        export NANOOPS_FUSED_ATTN_QKV="${NANOOPS_FUSED_ATTN_QKV-1}"
+        SAVE_EVERY=${NANOOPS_SAVE_EVERY:-50}
+        ;;
+    fuse)
+        # Full-fuse d24 path for performance runs: use fused MLP + fused QKV
+        # + fused SDPA/output tail, but do not activation-checkpoint MLP or
+        # full-attention layers.
+        export NANOOPS_MLP_CHECKPOINT=
+        export NANOOPS_L_ATTN_CHECKPOINT=
+        export NANOOPS_FUSED_MLP=1
+        export NANOOPS_FUSED_ATTN_QKV=1
+        SAVE_EVERY=${NANOOPS_SAVE_EVERY:-200}
+        ;;
+    *)
+        echo "Unknown NANOOPS_TRAIN_PATH='$TRAIN_PATH' (expected 'default' or 'fuse')" >&2
+        exit 2
+        ;;
+esac
 
 NPROC=${NPROC:-2}
 WANDB_RUN=${WANDB_RUN:-dummy}
+
+BASE_TRAIN_ARGS=(
+    --depth=24
+    --target-param-data-ratio=8
+    --device-batch-size=1
+    --val-device-batch-size=16
+    --save-every="$SAVE_EVERY"
+    --save-keep-last=3
+    --resume-from-step=-2
+    --run="$WANDB_RUN"
+)
+
+echo "nanoops train path: $TRAIN_PATH (NPROC=$NPROC, save_every=$SAVE_EVERY, run=$WANDB_RUN)"
 
 # NPROC=1: launch via plain python (NOT torchrun). torchrun unconditionally
 # sets RANK / LOCAL_RANK / WORLD_SIZE in env, which makes nanchat's
@@ -80,21 +100,10 @@ WANDB_RUN=${WANDB_RUN:-dummy}
 # to a file, so step lines / patch list would never appear in the log
 # until the buffer fills or the process exits.
 if [ "$NPROC" = "1" ]; then
-    python -u -m scripts.base_train --depth=24 --target-param-data-ratio=8 \
-        --device-batch-size=1 --val-device-batch-size=16 \
-        --save-every=50 --save-keep-last=3 --resume-from-step=-2 \
-        --run=$WANDB_RUN "$@"
+    python -u -m scripts.base_train "${BASE_TRAIN_ARGS[@]}" "$@"
 else
     torchrun --standalone --nproc_per_node=$NPROC -m scripts.base_train -- \
-        --depth=24 \
-        --target-param-data-ratio=8 \
-        --device-batch-size=1 \
-        --val-device-batch-size=16 \
-        --save-every=50 \
-        --save-keep-last=3 \
-        --resume-from-step=-2 \
-        --run=$WANDB_RUN \
-        "$@"
+        "${BASE_TRAIN_ARGS[@]}" "$@"
 fi
 # --depth=24 / device-batch-size=1 on 2× RTX 3090 (24 GiB each):
 # d24 auto-widens to D=1536, n_layer=24, ~1.5B params, ~1.67× heavier than
