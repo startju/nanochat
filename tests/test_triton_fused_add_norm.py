@@ -7,7 +7,7 @@ triton = pytest.importorskip("triton")
 if not torch.cuda.is_available():
     pytest.skip("triton kernels require CUDA", allow_module_level=True)
 
-from nanoops.triton_fused_add_norm import _pick_tile_config, fused_add_norm
+from nanoops.triton_fused_add_norm import _pick_fused_add_norm_tile_config, fused_add_norm
 
 
 def _reference(x, residual, nw, eps=1e-6):
@@ -80,7 +80,7 @@ def test_fused_add_norm_backward_large_d_fallback():
     torch.manual_seed(0)
     M, D = 8, 32768
     BLOCK_D = triton.next_power_of_2(D)
-    assert not _pick_tile_config(M, BLOCK_D, n_live_tiles=5).fits_reg_budget
+    assert not _pick_fused_add_norm_tile_config(M, BLOCK_D, n_live_tiles=5).fits_reg_budget
     x0 = torch.randn(M, D, dtype=torch.float32, device="cuda")
     r0 = torch.randn(M, D, dtype=torch.float32, device="cuda")
     nw0 = torch.randn(D, dtype=torch.float32, device="cuda")

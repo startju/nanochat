@@ -10,8 +10,8 @@ if not torch.cuda.is_available():
     pytest.skip("triton kernels require CUDA", allow_module_level=True)
 
 from nanoops.triton_fused_attn_qkv import (
-    _norm_qkv_projection_residual_mix_fwd_op,
-    _norm_qkv_projection_bwd_impl,
+    _norm_qkv_projection_with_residual_mix_fwd_op,
+    _norm_qkv_projection_with_residual_mix_bwd_impl,
     norm_qkv_projection_with_residual_mix,
 )
 from nanoops.triton_fused_attn_output import attn_output_proj_residual
@@ -491,7 +491,7 @@ def test_norm_qkv_projection_backward_formula():
     resid_scale = torch.ones((), dtype=x0.dtype, device=x0.device)
     x0_scale = torch.zeros((), dtype=x0.dtype, device=x0.device)
     q_saved, k_saved, _v_saved, _x_mix, rms_inv, qk_rms_inv = (
-        _norm_qkv_projection_residual_mix_fwd_op(
+        _norm_qkv_projection_with_residual_mix_fwd_op(
             x0.view(1, M, K),
             ident_x0,
             resid_scale,
@@ -522,7 +522,7 @@ def test_norm_qkv_projection_backward_formula():
         d_q_weight,
         d_k_weight,
         d_v_weight,
-    ) = _norm_qkv_projection_bwd_impl(
+    ) = _norm_qkv_projection_with_residual_mix_bwd_impl(
         qg.view(1, M, n_head, head_dim),
         kg.view(1, M, n_kv_head, head_dim),
         vg.view(1, M, n_kv_head, head_dim),

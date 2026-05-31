@@ -11,7 +11,7 @@ if not torch.cuda.is_available():
     pytest.skip("triton kernels require CUDA", allow_module_level=True)
 
 from nanoops.functional import sliding_window_sdpa
-from nanoops.triton_fused_attn_sdpa import flash_sdpa
+from nanoops.triton_fused_attn_sdpa import attn_sdpa
 
 
 @pytest.mark.parametrize("B,H,L,D,W", [
@@ -31,7 +31,7 @@ def test_forward_parity_fp32(B, H, L, D, W):
         v.transpose(1, 2),
         W,
     ).transpose(1, 2)
-    o_triton = flash_sdpa(q, k, v, W)
+    o_triton = attn_sdpa(q, k, v, W)
     max_diff = (o_ref - o_triton).abs().max().item()
     assert torch.allclose(o_ref, o_triton, atol=3e-3), \
         f"forward mismatch (max {max_diff:.4e}, B={B} H={H} L={L} D={D} W={W})"
@@ -59,7 +59,7 @@ def test_backward_parity_fp32(B, H, L, D, W):
 
     # Triton
     q2, k2, v2 = q0.clone().requires_grad_(True), k0.clone().requires_grad_(True), v0.clone().requires_grad_(True)
-    flash_sdpa(q2, k2, v2, W).backward(g)
+    attn_sdpa(q2, k2, v2, W).backward(g)
 
     atol = 8e-3
     for name, ref, got in [
@@ -89,7 +89,7 @@ def test_forward_parity_gqa_fp32(B, Hq, Hkv, L, D, W):
         W,
         enable_gqa=True,
     ).transpose(1, 2)
-    o_triton = flash_sdpa(q, k, v, W)
+    o_triton = attn_sdpa(q, k, v, W)
     max_diff = (o_ref - o_triton).abs().max().item()
     assert torch.allclose(o_ref, o_triton, atol=3e-3), \
         f"forward GQA mismatch (max {max_diff:.4e}, B={B} Hq={Hq} Hkv={Hkv} L={L} D={D} W={W})"
@@ -116,7 +116,7 @@ def test_backward_parity_gqa_fp32(B, Hq, Hkv, L, D, W):
     ).transpose(1, 2).backward(g)
 
     q2, k2, v2 = q0.clone().requires_grad_(True), k0.clone().requires_grad_(True), v0.clone().requires_grad_(True)
-    flash_sdpa(q2, k2, v2, W).backward(g)
+    attn_sdpa(q2, k2, v2, W).backward(g)
 
     atol = 8e-3
     for name, ref, got in [

@@ -197,7 +197,7 @@ nanchat d24 训练时各 matmul (M=2048, K=1536, N 不同)：
 
 **这就是 fusion 设计的根源**：独立的 RMSNorm kernel 做 ~4·M·D 字节 HBM
 流量，但算力收益接近 0。把 norm fuse 进邻接的 matmul kernel
-（mlp 走 `fused_mlp_block`）能让归一化的中间值留在 register 里，
+（mlp 走 `fused_mlp`）能让归一化的中间值留在 register 里，
 **省下 4·M·D 字节 HBM 流量**（norm 输出写回 + matmul 输入再读）——带宽
 bound 的 op 上**纯赚**。attn 侧 `norm_qkv_projection` 目前先用共享
 RMSNorm kernel 物化 `x_hat`，再做 Q/K/V projection；这个版本在 d24
@@ -349,7 +349,7 @@ naive 的比值不变。
 
 本 repo 里最简单的 fused kernel。**纯学习用**——nanchat 生产 block
 里 RMSNorm 已经直接 fold 进相邻的 matmul kernel（attn 走
-`norm_qkv_projection`，mlp 走 `fused_mlp_block`），所以根本不存在
+`norm_qkv_projection`，mlp 走 `fused_mlp`），所以根本不存在
 独立的 `add → norm` op 边界让这个 kernel 上 hot path。但这个 kernel
 用到的每一个 pattern 都是更大 fused kernel 的基石，所以它是学这些
 patterns 最干净的样本。
@@ -381,9 +381,9 @@ def fused_add_norm(x, residual, norm_weight, eps=1e-6) -> (y, summed)
 | Kernel | Grid | 角色 |
 |---|---|---|
 | `_fused_add_norm_fwd_kernel` | 1D over M | fwd：写 `y` + `summed` + `rms_inv` |
-| `_fused_add_norm_bwd_inline_kernel` | 1D over M | bwd **主路径**：整行单 tile、inner reduction in-register、写 `d_summed`（+ `dnw_partial`） |
-| `_fused_add_norm_inner_kernel` | 1D over M | bwd fallback 阶段 1：预算 `inner[m]` |
-| `_fused_add_norm_bwd_kernel` | 2D over (M, D) | bwd fallback 阶段 2：写 `d_summed` + `dnw_partial` |
+| `_fused_add_norm_inline_bwd_kernel` | 1D over M | bwd **主路径**：整行单 tile、inner reduction in-register、写 `d_summed`（+ `dnw_partial`） |
+| `_fused_add_norm_inner_bwd_kernel` | 1D over M | bwd fallback 阶段 1：预算 `inner[m]` |
+| `_fused_add_norm_split_bwd_kernel` | 2D over (M, D) | bwd fallback 阶段 2：写 `d_summed` + `dnw_partial` |
 
 ### 2.1 Forward kernel
 
@@ -449,7 +449,7 @@ bwd 有两套可行的 kernel 形状。具体跑哪套取决于 **inline kernel*
 
 #### 主路径：1 个 kernel，整行 in-register
 
-主路径是 `_fused_add_norm_bwd_inline_kernel`：1D grid over M，
+主路径是 `_fused_add_norm_inline_bwd_kernel`：1D grid over M，
 `BLOCK_D = next_pow_of_2(D)` 让**整行**塞进单 tile。这样
 per-row reduction `inner[m] = mean_d(g_eff · y_norm)` 直接在
 register 里算——不需要 precompute kernel、不需要 inner HBM buffer、
@@ -462,7 +462,7 @@ register 里算——不需要 precompute kernel、不需要 inner HBM buffer、
                                                  ≤ 255 reg/thread
 ```
 
-`_pick_tile_config(M, BLOCK_D, n_live_tiles=N)` 求能装下的最大
+`_pick_fused_add_norm_tile_config(M, BLOCK_D, n_live_tiles=N)` 求能装下的最大
 BLOCK_M。HAS_NW=True 时 N=5（`y_norm, g_eff, dy_t, d_ext, d_summed`
 峰值同时 alive），HAS_NW=False 时 N=4（`y_norm` 别名 `src`、`g_eff`
 别名 `dy_t`，少 2 个 distinct tile，但 `d_ext` 和 `d_summed` 还在，
@@ -498,14 +498,14 @@ per-program tile 拉回安全范围。同样一组 `(BLOCK_M=32, BLOCK_D=64)`
 学 Flash Attention 的「预算 reduction」pattern，fallback 拆成 2 个
 kernel：
 
-**Stage 1 —— `_fused_add_norm_inner_kernel`**（1D over M，每
+**Stage 1 —— `_fused_add_norm_inner_bwd_kernel`**（1D over M，每
 program 处理 `BLOCK_M` 行，单 tile 涵盖整 D）
 ```python
 inner[m] = mean_d(g_eff[m, *] * y_norm[m, *])
 # 写到 (M,) fp32 buffer
 ```
 
-**Stage 2 —— `_fused_add_norm_bwd_kernel`**（2D over M × D，每
+**Stage 2 —— `_fused_add_norm_split_bwd_kernel`**（2D over M × D，每
 program 处理一个 `(BLOCK_M, BLOCK_D)` 输出 tile）
 ```python
 inner_m = tl.load(inner_ptr + rows)              # 每行一个标量，预备好了
@@ -530,7 +530,7 @@ Stage 2 里原来跨整 D 的 pass 1 缩成「每行一个标量 load」。总 H
 
 **1900 vs 255 cap → 惨烈 spill**。BLOCK_M=32 + 整 D 确实 spill。
 但 inline 路径意识到 `BLOCK_M` 也是个自由参数——
-`_pick_tile_config(M, BLOCK_D, n_live_tiles=5)` 推导出
+`_pick_fused_add_norm_tile_config(M, BLOCK_D, n_live_tiles=5)` 推导出
 `BLOCK_M ≤ 1638·nw / BLOCK_D`（= 256 reg/thread 上限 / 5 tile，
 再摊到 nw·32 thread 上），向上取整到 pow-of-2。D=1536 时
 BLOCK_M 落到 4（regs ≈ 160），D=4096 时落到 1（也 ≈ 160），
@@ -568,7 +568,7 @@ tl.store(d_summed_ptr + offs, d_summed_tile.to(...), mask=mask)
 一个 sizing 决策 helper：
 
 ```python
-def _pick_tile_config(M, BLOCK_D, n_live_tiles) -> TileConfig:
+def _pick_fused_add_norm_tile_config(M, BLOCK_D, n_live_tiles) -> TileConfig:
     # Register-budget 模型（Ampere 255 fp32 reg/thread spill cap）：
     #     regs/thread ≈ n_live_tiles × (BLOCK_M × BLOCK_D) / (nw × 32)
     # 按 256-reg 上限算：tile ≤ (8192 / n_live_tiles) × nw
@@ -610,10 +610,10 @@ nw = next_pow2(8K/1638) = 8。→ `BLOCK_M=4, nw=8`，~160 reg/thread。
 Grid = cdiv(2048, 4) = 512。
 
 **2-kernel bwd fallback**：用**固定 config** `BLOCK_M=32, BLOCK_D=64,
-num_warps=4`，不走 `_pick_tile_config`。原因不是性能（autotune 选的
+num_warps=4`，不走 `_pick_fused_add_norm_tile_config`。原因不是性能（autotune 选的
 也差不多），而是 Triton autotune 的 dispatch 保留了一些不能 CUDA
 Graph stream capture 的操作。写死 config 让 fallback 路径对 graph
-友好。只有 inner 预算 kernel 用 `_pick_tile_config`（n_live=2）。
+友好。只有 inner 预算 kernel 用 `_pick_fused_add_norm_tile_config`（n_live=2）。
 
 ### 2.5 数值精度
 
@@ -738,7 +738,7 @@ inline kernel 用 `BLOCK_D = next_pow_of_2(D)` 把整行塞进一个 tile，
 2-kernel 路径同样的招：
 
 ```
-_fused_add_norm_bwd_inline_kernel:
+_fused_add_norm_inline_bwd_kernel:
   read summed/y            M·D
   read dy                  M·D
   read d_summed_external   M·D
@@ -766,12 +766,12 @@ fallback 到 2-kernel 对。切 D 的结构**没法**用 1-pass shared-mem
 （inner 一次，bwd 一次）：
 
 ```
-_fused_add_norm_inner_kernel:
+_fused_add_norm_inner_bwd_kernel:
   read summed/y            M·D
   read dy                  M·D
   write inner_buf          ~0  (M floats)                   ─┐ subtotal 2·M·D
                                                              │
-_fused_add_norm_bwd_kernel:                                  │
+_fused_add_norm_split_bwd_kernel:                                  │
   read summed/y            M·D   ← 重复读（L2 大概率 hit）
   read dy                  M·D   ← 重复读（L2 大概率 hit）
   read d_summed_external   M·D
@@ -845,13 +845,13 @@ framework overhead 的地方。
 更高，wall time 上还是赢。
 
 这也是为什么 nanchat 生产路径大多跳过这个 standalone op-boundary
-kernel：`fused_mlp_block` 把 norm 直接 fold 进自己的 matmul 路径；
+kernel：`fused_mlp` 把 norm 直接 fold 进自己的 matmul 路径；
 `norm_qkv_projection` 只复用其中的 RMSNorm 物化子 kernel，然后接
 Q/K/V projection。真正让 patterns 体现价值的，是更大的生产 kernel。
 
 ---
 
-## 第 3 章 —— `fused_mlp_block`：production-level、fwd+bwd 全 Triton
+## 第 3 章 —— `fused_mlp`：production-level、fwd+bwd 全 Triton
 
 第 2 章的 `FusedAddNorm` 是教学样本。这章是 nanchat mlp side 的**实际目标
 fusion**——standard transformer mlp 块（pre-norm + linear + relu² + linear
@@ -868,7 +868,7 @@ y = x + relu²(RMSNorm(x) @ W_fc.T) @ W_proj.T
 API 签名：
 
 ```python
-def fused_mlp_block(x, fc_weight, proj_weight, eps=1e-6) -> y
+def fused_mlp(x, fc_weight, proj_weight, eps=1e-6) -> y
 #   x、fc_weight、proj_weight 都必须是 contiguous CUDA tensors
 #   RMSNorm 固定是无 affine 版本；Python 入口不再接收 norm_weight。
 ```
@@ -885,13 +885,13 @@ matmul 本身是 compute-bound，但 bwd 的 dz/dW_proj/dW_fc/dx 每一步都
 
 | 阶段 | Kernel | Grid | 干什么 |
 |---|---|---|---|
-| Fwd 0 | `_rms_norm_fwd_kernel` | 1D over M | 无 affine RMSNorm 算 `x_hat` + 副产物 `rms_inv` |
-| Fwd 1 | `_cast_matmul_kernel` | 2D over (M, N_fc) | `z = x_hat @ W_fc.T`，W_fc 在 load 里 inline cast |
-| Fwd 2 | `_relu_sq_linear_residual_fwd_kernel` | 2D over (M, K_out) | relu² + c_proj + outer residual add → `y` |
-| Bwd A | `_mlp_dz_bwd_kernel` | 2D over (M, N_fc) | `dz` + 副产物 `inner_buf`（D 要用）|
-| Bwd B | `_mlp_dW_proj_bwd_kernel` | 2D over (K_out, N_fc) | `dW_proj`（fp32 master 输出）|
-| Bwd C | `_mlp_dW_fc_bwd_kernel` | 2D over (N_fc, K) | `dW_fc`（fp32 master 输出）|
-| Bwd D | `_mlp_dx_bwd_kernel` | 2D over (M, K) | `dx_hat` matmul + 无 affine RMSNorm bwd + outer residual fold → `dx` |
+| Fwd 0 | `_fused_mlp_rms_norm_fwd_kernel` | 1D over M | 无 affine RMSNorm 算 `x_hat` + 副产物 `rms_inv` |
+| Fwd 1 | `_fused_mlp_fc_matmul_fwd_kernel` | 2D over (M, N_fc) | `z = x_hat @ W_fc.T`，W_fc 在 load 里 inline cast |
+| Fwd 2 | `_fused_mlp_proj_residual_fwd_kernel` | 2D over (M, K_out) | relu² + c_proj + outer residual add → `y` |
+| Bwd A | `_fused_mlp_dz_bwd_kernel` | 2D over (M, N_fc) | `dz` + 副产物 `inner_buf`（D 要用）|
+| Bwd B | `_fused_mlp_dproj_weight_bwd_kernel` | 2D over (K_out, N_fc) | `dW_proj`（fp32 master 输出）|
+| Bwd C | `_fused_mlp_dfc_weight_bwd_kernel` | 2D over (N_fc, K) | `dW_fc`（fp32 master 输出）|
+| Bwd D | `_fused_mlp_dx_bwd_kernel` | 2D over (M, K) | `dx_hat` matmul + 无 affine RMSNorm bwd + outer residual fold → `dx` |
 
 **fwd/bwd 全 Triton 是故意的**——nanchat 训练时 d24 shape (M=2048, N_fc=6144,
 K=1536) 上，每个 matmul 都能跟相邻的 elementwise / weight cast / reduction
@@ -905,11 +905,11 @@ matmul 相对 cuBLAS 的 10-15% 效率劣势。Step 1 看起来是孤立的大 m
 
 #### 3.2.1 Step 0 —— 无 affine RMSNorm
 
-fwd 使用本文件内的小 `_rms_norm_fwd_kernel`：
+fwd 使用本文件内的小 `_fused_mlp_rms_norm_fwd_kernel`：
 
 ```python
-# Step 0 caller (_fused_mlp_block_fwd_impl)
-_rms_norm_fwd_kernel[...](
+# Step 0 caller (_fused_mlp_fwd_impl)
+_fused_mlp_rms_norm_fwd_kernel[...](
     x,
     x_hat,
     rms_inv,
@@ -931,7 +931,7 @@ tl.store(rms_inv_ptr + rows, rms_inv, ...)
 这里固定是无 affine：nanchat 热路径的 RMSNorm 没有 learnable per-channel
 scale，Python API 也不再接收 `norm_weight`。
 
-#### 3.2.2 Step 1 —— `_cast_matmul_kernel`：c_fc + inline weight cast
+#### 3.2.2 Step 1 —— `_fused_mlp_fc_matmul_fwd_kernel`：c_fc + inline weight cast
 
 c_fc 本身是个孤立的大 matmul，没有相邻 elementwise 副产物可以 fuse 进
 matmul 的 register stage。但 fc_weight 在 nanchat 里是 **fp32 master**，
@@ -949,7 +949,7 @@ d24 上这一来回大约 75 μs，正好把 cuBLAS 相对 Triton ~10-15% 的效
 
 ```python
 @triton.jit
-def _cast_matmul_kernel(x_ptr, w_ptr, z_ptr, M, N, K, ...):
+def _fused_mlp_fc_matmul_fwd_kernel(x_ptr, w_ptr, z_ptr, M, N, K, ...):
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     for k_start in range(0, K, BLOCK_K):
         x_tile = tl.load(x_ptr + ...)                  # bf16
@@ -969,7 +969,7 @@ d24 manual sweep 锁了 `(BLOCK_M=256, BLOCK_N=64, BLOCK_K=32, nw=8, st=2)`，
 shared mem `(256·32 + 64·32)·4 = 40 KB`，×2 stages = 80 KB，在 3090 SM
 的 100 KB 预算内，所以同一份配置对 parity test 也安全。
 
-#### 3.2.3 Step 2 —— `_relu_sq_linear_residual_fwd_kernel`
+#### 3.2.3 Step 2 —— `_fused_mlp_proj_residual_fwd_kernel`
 
 把 `relu²(z) @ W_proj.T + x` 三个 op 塞一个 Triton kernel 里：
 
@@ -1011,7 +1011,7 @@ bwd 出 4 个梯度 tensor：`dz, dW_proj, dW_fc, dx`。这 4 个 reduction 轴
 **不可能塞进单 kernel**。但每一步都跟相邻 elementwise fuse 掉了一次 HBM
 round-trip。
 
-#### 3.3.1 Step A —— `_mlp_dz_bwd_kernel`：matmul + relu² bwd + side-output
+#### 3.3.1 Step A —— `_fused_mlp_dz_bwd_kernel`：matmul + relu² bwd + side-output
 
 数学：
 ```
@@ -1103,7 +1103,7 @@ inner 需要把这 48 个 partial 沿 N 加起来。可选方案：
 atomic_add 优势：dz/z 已经在 register、目标 buffer (M,) 全在 L2、不要额外
 buffer 也不要额外 launch。**self-contained 在 kernel 内**。
 
-#### 3.3.2 Step B —— `_mlp_dW_proj_bwd_kernel`：dy.T @ relu²(z)
+#### 3.3.2 Step B —— `_fused_mlp_dproj_weight_bwd_kernel`：dy.T @ relu²(z)
 
 ```python
 acc = tl.zeros((BLOCK_K_OUT, BLOCK_N), dtype=tl.float32)
@@ -1132,7 +1132,7 @@ d24 locked: `(BLOCK_K_OUT=64, BLOCK_N=128, BLOCK_M=64, nw=4, st=2)`。注意
 B 是这一组里唯一不需要 inline weight cast 的 matmul——dy 和 z 都是 bf16
 （caller 直接是 bf16，不是 fp32 master），没东西可 cast。
 
-#### 3.3.3 Step C —— `_mlp_dW_fc_bwd_kernel`：dz.T @ x_hat，x_hat 重算
+#### 3.3.3 Step C —— `_fused_mlp_dfc_weight_bwd_kernel`：dz.T @ x_hat，x_hat 重算
 
 ```python
 acc = tl.zeros((BLOCK_N, BLOCK_K), dtype=tl.float32)
@@ -1166,7 +1166,7 @@ d24 locked: `(BLOCK_M=64, BLOCK_N=64, BLOCK_K=128, nw=4, st=2)`。注意 C
 是 `x_hat.to(bf16)`，不是 weight cast——但效果一样（bf16 tile 喂 tensor
 core）。
 
-#### 3.3.4 Step D —— `_mlp_dx_bwd_kernel`：dx 全部来源汇总
+#### 3.3.4 Step D —— `_fused_mlp_dx_bwd_kernel`：dx 全部来源汇总
 
 x 在 forward 中出现两次：
 ```
@@ -1249,7 +1249,7 @@ defer 招——dy 不需要升 fp32，最后那次加法在 bf16 里完成。
 
 | Op | 谁负责 | 为什么 |
 |---|---|---|
-| Fwd c_fc matmul (z = x_hat @ W_fc) | Triton (`_cast_matmul_kernel`) | fp32→bf16 weight cast 折进 load，省 36 MB HBM 往返 + 1 launch，盖过 cuBLAS ~10-15% 效率优势 |
+| Fwd c_fc matmul (z = x_hat @ W_fc) | Triton (`_fused_mlp_fc_matmul_fwd_kernel`) | fp32→bf16 weight cast 折进 load，省 36 MB HBM 往返 + 1 launch，盖过 cuBLAS ~10-15% 效率优势 |
 | Fwd relu² + c_proj + residual | Triton | 三 op fused，r 不出 HBM；proj_w 同样 inline cast |
 | Fwd RMSNorm | Triton | 本地无 affine RMSNorm kernel 写 x_hat + rms_inv |
 | Bwd dz (A) | Triton | matmul + relu² bwd + atomic_add 副产物，三 in one；proj_w inline cast |
@@ -1413,8 +1413,8 @@ d24 (M=2048, N_fc=6144, K=1536, bf16 activation, fp32 master weight)
 
 ### 3.8 End-to-end 落地
 
-`fused_mlp_block` 在 d24 上单 op fwd+bwd 净赢 ~9%（micro-bench；cast fusion 后
-更高）。落地到 nanchat 训练靠 `NANOOPS_FUSED_MLP_BLOCK=1` 环境变量，由
+`fused_mlp` 在 d24 上单 op fwd+bwd 净赢 ~9%（micro-bench；cast fusion 后
+更高）。落地到 nanchat 训练靠 `NANOOPS_FUSED_MLP=1` 环境变量，由
 `nanoops/integration.py` 在 `patch_nanchat()` 时 monkey-patch 掉
 `nanchat.gpt.Block.forward` 的 mlp side：
 
@@ -1425,14 +1425,14 @@ def _patched_block_forward(self, x, ve, cos_sin, window_size, kv_cache):
         return x + self.mlp(_orig_norm(x))          # CPU / kv-cache fallback
     B, T, C = x.shape
     x_2d = x.reshape(B * T, C).contiguous()
-    y_2d = _fused_mlp_block(x_2d, self.mlp.c_fc.weight, self.mlp.c_proj.weight)
+    y_2d = _fused_mlp(x_2d, self.mlp.c_fc.weight, self.mlp.c_proj.weight)
     return y_2d.reshape(B, T, C)
 ```
 
 fused block 固定使用 nanchat 的无 affine RMSNorm；`_orig_norm` 是原
 `Block.norm`，被捕获在 module global 里。
 
-**单 op 增益不完全等于 end-to-end 增益**，但 `fused_mlp_block` 现在
+**单 op 增益不完全等于 end-to-end 增益**，但 `fused_mlp` 现在
 封装成 `torch.library.custom_op`（fwd / bwd 各一个，配 `register_fake`
 + `register_autograd`），torch.compile 能把它当成一个 opaque FX 节点，
 **不再 graph-break、不再 trace 进 Triton kernel**，Inductor 继续在
@@ -1448,7 +1448,7 @@ d24 + B=1 end-to-end 实测（同 checkpoint resume 5 步均值，3090 ×2）：
 
 | 路径 | dt (ms) | tok/sec | bf16_mfu (%) | vs baseline |
 |---|---:|---:|---:|---:|
-| baseline（不开 FUSED_MLP_BLOCK） | 67,175 | 15,610 | 52.49 | — |
+| baseline（不开 FUSED_MLP） | 67,175 | 15,610 | 52.49 | — |
 | FUSED + `autograd.Function`（旧） | 65,452 | 16,021 | 53.88 | +2.63% |
 | FUSED + `custom_op`（现） | **65,038** | **16,124** | **54.22** | **+3.29%** |
 

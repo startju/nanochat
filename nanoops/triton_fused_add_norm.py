@@ -4,10 +4,10 @@
 output for the next block's residual stream. See `fused_add_norm` and
 TRITON_zh.md Chapter 2.
 
-Also hosts the shared `TileConfig` / `_pick_tile_config` sizing helper.
+Also hosts the shared `TileConfig` / `_pick_fused_add_norm_tile_config` sizing helper.
 The sibling Triton modules in this package import what they need from
 here:
-  - `triton_fused_mlp_block.py` imports `_pick_tile_config` (sizes its
+  - `triton_fused_mlp.py` imports `_pick_fused_add_norm_tile_config` (sizes its
     Step 0 RMSNorm) and `_fused_add_norm_fwd_kernel` (the kernel itself,
     reused with HAS_RESIDUAL=False).
   - `triton_fused_attn_qkv.py` reuses the forward RMSNorm materialization
@@ -43,11 +43,11 @@ except ImportError:
 # Backward: two paths, dispatched in `_fused_add_norm_bwd_impl` based
 # on whether the inline kernel's per-program tile fits in the 255 fp32
 # reg/thread cap (checked via TileConfig.fits_reg_budget):
-#   Primary — _fused_add_norm_bwd_inline_kernel: single-pass, full
+#   Primary — _fused_add_norm_inline_bwd_kernel: single-pass, full
 #     row in one tile, inner reduction computed in registers. Used
 #     whenever it fits (covers all nanchat shapes). Wins 1.5–2.4× over
 #     the 2-kernel path on common D.
-#   Fallback — _fused_add_norm_inner_kernel + _fused_add_norm_bwd_kernel:
+#   Fallback — _fused_add_norm_inner_bwd_kernel + _fused_add_norm_split_bwd_kernel:
 #     Flash-Attention style 2-pass (pre-compute inner[m], then 2D-tile
 #     grid over (M, D) for d_summed + dnw_partial). Engages when inline
 #     would spill (HAS_NW=True at D ≥ 32K).
@@ -61,7 +61,7 @@ except ImportError:
 
 
 class TileConfig(NamedTuple):
-    """Output of `_pick_tile_config`. The `fits_reg_budget` property is
+    """Output of `_pick_fused_add_norm_tile_config`. The `fits_reg_budget` property is
     what callers query to decide whether to use this kernel at the
     chosen tile or fall back to a different shape (e.g. a 2-kernel
     D-split path that uses less register space per program)."""
@@ -89,7 +89,7 @@ class TileConfig(NamedTuple):
         return self.est_regs_per_thread <= 256
 
 
-def _pick_tile_config(M: int, BLOCK_D: int, n_live_tiles: int) -> TileConfig:
+def _pick_fused_add_norm_tile_config(M: int, BLOCK_D: int, n_live_tiles: int) -> TileConfig:
     """Pick (BLOCK_M, num_warps) for a (BLOCK_M × BLOCK_D)-tiled kernel.
 
     Register-budget model (Ampere, 255 fp32 regs/thread spill cap):
@@ -176,7 +176,7 @@ if _HAS_TRITON:
         test_triton_norm_mlp.py). Register pressure stays in the same
         bracket as the explicit-fp32 implementation — Triton materializes
         an fp32 tile for the auto-promoted `summed * rms_inv` anyway —
-        so `_pick_tile_config(..., n_live_tiles=2)` still sizes right.
+        so `_pick_fused_add_norm_tile_config(..., n_live_tiles=2)` still sizes right.
 
         HAS_NW=False ⇒ no per-channel affine weight; output is plain
         `summed / RMS(summed)`. nw_ptr is then not dereferenced."""
@@ -222,7 +222,7 @@ if _HAS_TRITON:
     # becomes the HBM bottleneck. Above that, `_fused_add_norm_bwd_impl`
     # dispatches to the inner + 2D-tile fallback pair below.
     @triton.jit
-    def _fused_add_norm_bwd_inline_kernel(
+    def _fused_add_norm_inline_bwd_kernel(
         ynorm_src_ptr,  # (M, D) bf16 — in: `summed` if HAS_NW else `y` (== y_norm)
         rms_inv_ptr,  # (M,) fp32 — in: from fwd
         nw_ptr,  # (D,) bf16 — in: norm_weight (untouched when HAS_NW=False; pass ynorm_src as placeholder)
@@ -241,9 +241,9 @@ if _HAS_TRITON:
         is computed inline (no precompute kernel, no inner HBM buffer).
 
         Same `ynorm_src_ptr` / `d_ext_ptr` semantics as the 2D-tile
-        `_fused_add_norm_bwd_kernel` (below).
+        `_fused_add_norm_split_bwd_kernel` (below).
 
-        BLOCK_M / num_warps come from `_pick_tile_config(M, BLOCK_D,
+        BLOCK_M / num_warps come from `_pick_fused_add_norm_tile_config(M, BLOCK_D,
         n_live_tiles=N)` — N=5 for HAS_NW=True (y_norm, g_eff, dy_t,
         d_ext, d_summed alive at peak), N=4 for HAS_NW=False (y_norm
         aliases src and g_eff aliases dy_t when there's no per-channel
@@ -303,7 +303,7 @@ if _HAS_TRITON:
             )
 
     @triton.jit
-    def _fused_add_norm_inner_kernel(
+    def _fused_add_norm_inner_bwd_kernel(
         ynorm_src_ptr,  # (M, D) bf16 — in: `summed` if HAS_NW else `y` (== y_norm)
         rms_inv_ptr,  # (M,) fp32 — in: from fwd
         nw_ptr,  # (D,) bf16 — in: norm_weight (untouched when HAS_NW=False; pass ynorm_src as placeholder)
@@ -370,13 +370,13 @@ if _HAS_TRITON:
     # kwargs to keep them visible at the call site rather than buried
     # in autotune state.
     @triton.jit
-    def _fused_add_norm_bwd_kernel(
+    def _fused_add_norm_split_bwd_kernel(
         ynorm_src_ptr,  # (M, D) bf16 — in: `summed` if HAS_NW else `y` (== y_norm)
         rms_inv_ptr,  # (M,) fp32 — in: from fwd
         nw_ptr,  # (D,) bf16 — in: norm_weight (untouched when HAS_NW=False; pass ynorm_src as placeholder)
         dy_ptr,  # (M, D) bf16 — in: ∂L/∂y
         d_ext_ptr,  # (M, D) bf16 — in: ∂L/∂summed from caller's other usage (folded into d_summed)
-        inner_ptr,  # (M,) fp32 — in: precomputed by `_fused_add_norm_inner_kernel`
+        inner_ptr,  # (M,) fp32 — in: precomputed by `_fused_add_norm_inner_bwd_kernel`
         d_summed_ptr,  # (M, D) bf16 — out: ∂L/∂summed total (norm-bwd + d_ext)
         dnw_partial_ptr,  # (num_m_tiles, D) bf16 — out: per-m-tile dnw partials (untouched when HAS_NW=False; pass ynorm_src as placeholder)
         M,  # int — row count after flattening leading dims
@@ -386,7 +386,7 @@ if _HAS_TRITON:
         HAS_NW: tl.constexpr,
     ):
         """RMSNorm backward second-stage kernel (paired with
-        `_fused_add_norm_inner_kernel` which pre-computes inner[m]).
+        `_fused_add_norm_inner_bwd_kernel` which pre-computes inner[m]).
 
         The `ynorm_src_ptr` tensor is interpreted based on HAS_NW:
           - HAS_NW=True : pointer is to `summed`; kernel reconstructs
@@ -404,7 +404,7 @@ if _HAS_TRITON:
         which would force the whole D into a single tile and spill).
 
         `inner_ptr` is the per-row reduction `inner[m] = mean_d(g_eff *
-        y_norm)`, pre-computed by `_fused_add_norm_inner_kernel`. This
+        y_norm)`, pre-computed by `_fused_add_norm_inner_bwd_kernel`. This
         avoids each d_tile program recomputing the same full-D reduction
         (would be D/BLOCK_D × redundant otherwise).
 
@@ -529,14 +529,14 @@ def _fused_add_norm_fwd_impl(
     # the trailing lanes so they don't affect the reduction.
     BLOCK_D = triton.next_power_of_2(D)
 
-    # Tile sizing via the shared _pick_tile_config helper. fwd's hot
+    # Tile sizing via the shared _pick_fused_add_norm_tile_config helper. fwd's hot
     # path holds ~2 fp32 tiles alive simultaneously: the auto-promoted
     # summed-as-fp32 (used for both sum_sq and `summed * rms_inv`), and
     # the y_f32 result tile that holds the scaled values until store
     # (optionally multiplied by nw when HAS_NW=True). The helper
     # translates that to BLOCK_M and num_warps under the Ampere 255
     # fp32 reg/thread spill cap (see helper docstring for the formula).
-    cfg = _pick_tile_config(M, BLOCK_D, n_live_tiles=2)
+    cfg = _pick_fused_add_norm_tile_config(M, BLOCK_D, n_live_tiles=2)
     BLOCK_M, num_warps = cfg.block_m, cfg.num_warps
 
     # HAS_NW=False path doesn't dereference nw_ptr; pass `x` as a
@@ -574,11 +574,11 @@ def _fused_add_norm_bwd_impl(
     `summed = x + residual`). dnw is None when norm_weight is None.
 
     Dispatches between two paths based on inline-tile reg budget:
-      (A) inline single-kernel `_fused_add_norm_bwd_inline_kernel` —
+      (A) inline single-kernel `_fused_add_norm_inline_bwd_kernel` —
           full D in one tile, inner reduction in registers, no precompute.
           Wins 1.5–2.4× on most shapes (kernel-only).
-      (B) 2-kernel D-split fallback `_fused_add_norm_inner_kernel` +
-          `_fused_add_norm_bwd_kernel` — used when inline tile would
+      (B) 2-kernel D-split fallback `_fused_add_norm_inner_bwd_kernel` +
+          `_fused_add_norm_split_bwd_kernel` — used when inline tile would
           exceed Ampere's 255 fp32 reg/thread cap (HAS_NW=True at D ≥ 32K).
 
     Both paths reconstruct y_norm = ynorm_src · rms_inv (when HAS_NW=True;
@@ -614,7 +614,7 @@ def _fused_add_norm_bwd_impl(
     # the 2-kernel D-split path which uses a much smaller fixed tile.
     BLOCK_D = triton.next_power_of_2(D)
     inline_n_live = 5 if has_nw else 4
-    inline_cfg = _pick_tile_config(M, BLOCK_D, n_live_tiles=inline_n_live)
+    inline_cfg = _pick_fused_add_norm_tile_config(M, BLOCK_D, n_live_tiles=inline_n_live)
     use_inline = inline_cfg.fits_reg_budget
 
     if use_inline:
@@ -629,7 +629,7 @@ def _fused_add_norm_bwd_impl(
         else:
             nw_arg = dnw_arg = ynorm_src  # dummy ptrs; kernel skips deref
 
-        wrap_triton(_fused_add_norm_bwd_inline_kernel)[(num_m_tiles,)](
+        wrap_triton(_fused_add_norm_inline_bwd_kernel)[(num_m_tiles,)](
             ynorm_src,
             rms_inv,
             nw_arg,
@@ -661,8 +661,8 @@ def _fused_add_norm_bwd_impl(
         # Stage 1: pre-compute inner[m]. fwd-style sizing
         # (n_live_tiles=2: y_norm and g_eff alive together briefly).
         INNER_BLOCK_D = triton.next_power_of_2(D)
-        inner_cfg = _pick_tile_config(M, INNER_BLOCK_D, n_live_tiles=2)
-        wrap_triton(_fused_add_norm_inner_kernel)[
+        inner_cfg = _pick_fused_add_norm_tile_config(M, INNER_BLOCK_D, n_live_tiles=2)
+        wrap_triton(_fused_add_norm_inner_bwd_kernel)[
             (triton.cdiv(M, inner_cfg.block_m),)
         ](
             ynorm_src,
@@ -679,7 +679,7 @@ def _fused_add_norm_bwd_impl(
         )
 
         # Stage 2: bwd reads pre-computed inner; 2D grid splits D.
-        wrap_triton(_fused_add_norm_bwd_kernel)[
+        wrap_triton(_fused_add_norm_split_bwd_kernel)[
             (num_m_tiles, triton.cdiv(D, BLOCK_D_BWD))
         ](
             ynorm_src,

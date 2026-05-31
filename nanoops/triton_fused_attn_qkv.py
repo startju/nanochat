@@ -14,7 +14,7 @@ from typing import Any
 import torch
 from torch.library import wrap_triton
 
-from .triton_fused_add_norm import _pick_tile_config
+from .triton_fused_add_norm import _pick_fused_add_norm_tile_config
 
 try:
     import triton
@@ -23,6 +23,50 @@ try:
     _HAS_TRITON = True
 except ImportError:
     _HAS_TRITON = False
+
+
+# d24 compile-path tuning constants. Kept module-local so benchmark harnesses
+# can monkeypatch them before torch.compile without editing kernel code.
+_QKV_FWD_VE_BLOCK_M = 64
+_QKV_FWD_VE_BLOCK_K = 16
+_QKV_FWD_VE_NUM_WARPS = 4
+_QKV_FWD_VE_NUM_STAGES = 3
+_QKV_FWD_NO_VE_BLOCK_M = 128
+_QKV_FWD_NO_VE_BLOCK_K = 32
+_QKV_FWD_NO_VE_NUM_WARPS = 4
+_QKV_FWD_NO_VE_NUM_STAGES = 1
+
+_QKV_BWD_QK_PRE_VE_BLOCK_M = 8
+_QKV_BWD_QK_PRE_VE_NUM_WARPS = 8
+_QKV_BWD_QK_PRE_VE_NUM_STAGES = 1
+_QKV_BWD_QK_PRE_NO_VE_BLOCK_M = 32
+_QKV_BWD_QK_PRE_NO_VE_NUM_WARPS = 4
+_QKV_BWD_QK_PRE_NO_VE_NUM_STAGES = 1
+
+_QKV_BWD_DX_HAT_VE_BLOCK_M = 128
+_QKV_BWD_DX_HAT_VE_BLOCK_K = 64
+_QKV_BWD_DX_HAT_VE_HEAD_SPLIT = 4
+_QKV_BWD_DX_HAT_VE_CAST_WEIGHTS = False
+_QKV_BWD_DX_HAT_VE_NUM_WARPS = 4
+_QKV_BWD_DX_HAT_VE_NUM_STAGES = 1
+_QKV_BWD_DX_HAT_NO_VE_BLOCK_M = 128
+_QKV_BWD_DX_HAT_NO_VE_BLOCK_K = 64
+_QKV_BWD_DX_HAT_NO_VE_HEAD_SPLIT = 4
+_QKV_BWD_DX_HAT_NO_VE_CAST_WEIGHTS = False
+_QKV_BWD_DX_HAT_NO_VE_NUM_WARPS = 4
+_QKV_BWD_DX_HAT_NO_VE_NUM_STAGES = 1
+
+_QKV_BWD_X_NORM_BLOCK_M = 128
+_QKV_BWD_X_NORM_BLOCK_K = 64
+_QKV_BWD_X_NORM_NUM_WARPS = 4
+_QKV_BWD_OUTER_RMS_BLOCK_M = 128
+_QKV_BWD_OUTER_RMS_BLOCK_K = 64
+_QKV_BWD_OUTER_RMS_NUM_WARPS = 4
+_QKV_BWD_WEIGHT_GRAD_BLOCK_N = 64
+_QKV_BWD_WEIGHT_GRAD_BLOCK_K = 128
+_QKV_BWD_WEIGHT_GRAD_BLOCK_M = 32
+_QKV_BWD_WEIGHT_GRAD_NUM_WARPS = 4
+_QKV_BWD_WEIGHT_GRAD_NUM_STAGES = 2
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -46,7 +90,7 @@ except ImportError:
 
 if _HAS_TRITON:
     @triton.jit
-    def _residual_mix_norm_fwd_kernel(
+    def _norm_qkv_projection_with_residual_mix_norm_fwd_kernel(
         x_ptr,  # (M, K), dtype=x.dtype — in: previous layer residual stream
         x0_ptr,  # (M, K), dtype=x.dtype — in: initial embedding stream
         resid_scale_ptr,  # scalar tensor — in: resid_lambdas[i]
@@ -84,7 +128,7 @@ if _HAS_TRITON:
         tl.store(x_hat_ptr + offs, x_hat.to(x_hat_ptr.dtype.element_ty), mask=mask)
 
     @triton.jit
-    def _qkv_projection_fwd_kernel(
+    def _norm_qkv_projection_qkv_fwd_kernel(
         x_ptr,  # (M, K), dtype=x.dtype — in: materialized outer RMSNorm output
         q_w_ptr,  # (n_head * D, K), dtype=q_weight.dtype — in: Q projection weight
         k_w_ptr,  # (n_kv_head * D, K), dtype=k_weight.dtype — in: K projection weight
@@ -263,7 +307,7 @@ if _HAS_TRITON:
     #   5. compute Q/K/V projection weight gradients from the materialized grads.
 
     @triton.jit
-    def _x_norm_from_residual_mix_bwd_kernel(
+    def _norm_qkv_projection_x_norm_bwd_kernel(
         x_base_ptr,  # (M, K) — in: residual stream before mix
         x0_ptr,  # (M, K) — in: initial embedding stream
         resid_scale_ptr,  # scalar — in
@@ -304,7 +348,7 @@ if _HAS_TRITON:
         )
 
     @triton.jit
-    def _qk_proj_grad_ve_bwd_kernel(
+    def _norm_qkv_projection_qk_pre_ve_bwd_kernel(
         q_ptr,  # (M, n_head, D), dtype=x.dtype — in: final Q output
         k_ptr,  # (M, n_kv_head, D), dtype=x.dtype — in: final K output
         qk_rms_inv_ptr,  # (M, n_head + n_kv_head), fp32 — in
@@ -483,7 +527,7 @@ if _HAS_TRITON:
             )
 
     @triton.jit
-    def _qkv_dx_hat_from_proj_grad_bwd_kernel(
+    def _norm_qkv_projection_dx_hat_bwd_kernel(
         d_q_pre_ptr,  # (M, n_head, D), dtype=x.dtype — in
         d_k_pre_ptr,  # (M, n_kv_head, D), dtype=x.dtype — in
         d_v_ptr,  # (M, n_kv_head, D) — in
@@ -609,7 +653,7 @@ if _HAS_TRITON:
         )
 
     @triton.jit
-    def _qkv_weight_grad_from_proj_grad_bwd_kernel(
+    def _norm_qkv_projection_weight_grad_bwd_kernel(
         d_q_pre_ptr,  # (M, n_head, D), dtype=x.dtype — in
         d_k_pre_ptr,  # (M, n_kv_head, D), dtype=x.dtype — in
         d_v_ptr,  # (M, n_kv_head, D) — in
@@ -701,7 +745,7 @@ if _HAS_TRITON:
             )
 
     @triton.jit
-    def _qkv_weight_grad_section_bwd_kernel(
+    def _norm_qkv_projection_weight_section_bwd_kernel(
         d_q_pre_ptr,  # (M, n_head, D), dtype=x.dtype — in
         d_k_pre_ptr,  # (M, n_kv_head, D), dtype=x.dtype — in
         d_v_ptr,  # (M, n_kv_head, D) — in
@@ -779,7 +823,7 @@ if _HAS_TRITON:
             )
 
     @triton.jit
-    def _outer_rms_dx_from_dx_hat_bwd_kernel(
+    def _norm_qkv_projection_outer_rms_dx_bwd_kernel(
         x_norm_ptr,  # (M, K), dtype=x.dtype — in: materialized RMSNorm(x_mix)
         rms_inv_ptr,  # (M,) fp32 — in
         dx_hat_ptr,  # (M, K), dtype=x.dtype — in: materialized d_x_hat
@@ -880,7 +924,7 @@ def _validate_rotary_table_4d(
     )
 
 
-def _norm_qkv_projection_bwd_impl(
+def _norm_qkv_projection_with_residual_mix_bwd_impl(
     d_q: torch.Tensor,
     d_k: torch.Tensor,
     d_v: torch.Tensor,
@@ -918,7 +962,7 @@ def _norm_qkv_projection_bwd_impl(
     torch.Tensor,
     torch.Tensor,
 ]:
-    """Backward implementation for `nanoops::norm_qkv_projection_bwd`.
+    """Backward implementation for `nanoops::norm_qkv_projection_with_residual_mix_bwd`.
 
     This function launches Triton kernels for the fp32 algebra used by the
     Triton-op autograd callback. Rotary cos/sin are treated as constants.
@@ -1187,23 +1231,36 @@ def _norm_qkv_projection_bwd_impl(
         d_ve_gate_weight_for_kernel = x_base_flat
 
     if has_value_embedding:
-        QK_PRE_BLOCK_M, QK_PRE_NUM_WARPS, QK_PRE_NUM_STAGES = 8, 8, 1
-        DX_HAT_BLOCK_M, DX_HAT_BLOCK_K = 128, 64
-        DX_HAT_HEAD_SPLIT = 4
-        DX_HAT_CAST_WEIGHTS = False
-        DX_HAT_NUM_WARPS, DX_HAT_NUM_STAGES = 4, 1
+        QK_PRE_BLOCK_M = _QKV_BWD_QK_PRE_VE_BLOCK_M
+        QK_PRE_NUM_WARPS = _QKV_BWD_QK_PRE_VE_NUM_WARPS
+        QK_PRE_NUM_STAGES = _QKV_BWD_QK_PRE_VE_NUM_STAGES
+        DX_HAT_BLOCK_M = _QKV_BWD_DX_HAT_VE_BLOCK_M
+        DX_HAT_BLOCK_K = _QKV_BWD_DX_HAT_VE_BLOCK_K
+        DX_HAT_HEAD_SPLIT = _QKV_BWD_DX_HAT_VE_HEAD_SPLIT
+        DX_HAT_CAST_WEIGHTS = _QKV_BWD_DX_HAT_VE_CAST_WEIGHTS
+        DX_HAT_NUM_WARPS = _QKV_BWD_DX_HAT_VE_NUM_WARPS
+        DX_HAT_NUM_STAGES = _QKV_BWD_DX_HAT_VE_NUM_STAGES
     else:
-        QK_PRE_BLOCK_M, QK_PRE_NUM_WARPS, QK_PRE_NUM_STAGES = 32, 4, 1
-        DX_HAT_BLOCK_M, DX_HAT_BLOCK_K = 128, 64
-        DX_HAT_HEAD_SPLIT = 4
-        DX_HAT_CAST_WEIGHTS = False
-        DX_HAT_NUM_WARPS, DX_HAT_NUM_STAGES = 4, 1
-    X_NORM_BLOCK_M, X_NORM_BLOCK_K = 128, 64
-    X_NORM_NUM_WARPS = 4
-    OUTER_RMS_BLOCK_M, OUTER_RMS_BLOCK_K = 128, 64
-    OUTER_RMS_NUM_WARPS = 4
-    WEIGHT_GRAD_BLOCK_N, WEIGHT_GRAD_BLOCK_K, WEIGHT_GRAD_BLOCK_M = 64, 128, 32
-    WEIGHT_GRAD_NUM_WARPS, WEIGHT_GRAD_NUM_STAGES = 4, 2
+        QK_PRE_BLOCK_M = _QKV_BWD_QK_PRE_NO_VE_BLOCK_M
+        QK_PRE_NUM_WARPS = _QKV_BWD_QK_PRE_NO_VE_NUM_WARPS
+        QK_PRE_NUM_STAGES = _QKV_BWD_QK_PRE_NO_VE_NUM_STAGES
+        DX_HAT_BLOCK_M = _QKV_BWD_DX_HAT_NO_VE_BLOCK_M
+        DX_HAT_BLOCK_K = _QKV_BWD_DX_HAT_NO_VE_BLOCK_K
+        DX_HAT_HEAD_SPLIT = _QKV_BWD_DX_HAT_NO_VE_HEAD_SPLIT
+        DX_HAT_CAST_WEIGHTS = _QKV_BWD_DX_HAT_NO_VE_CAST_WEIGHTS
+        DX_HAT_NUM_WARPS = _QKV_BWD_DX_HAT_NO_VE_NUM_WARPS
+        DX_HAT_NUM_STAGES = _QKV_BWD_DX_HAT_NO_VE_NUM_STAGES
+    X_NORM_BLOCK_M = _QKV_BWD_X_NORM_BLOCK_M
+    X_NORM_BLOCK_K = _QKV_BWD_X_NORM_BLOCK_K
+    X_NORM_NUM_WARPS = _QKV_BWD_X_NORM_NUM_WARPS
+    OUTER_RMS_BLOCK_M = _QKV_BWD_OUTER_RMS_BLOCK_M
+    OUTER_RMS_BLOCK_K = _QKV_BWD_OUTER_RMS_BLOCK_K
+    OUTER_RMS_NUM_WARPS = _QKV_BWD_OUTER_RMS_NUM_WARPS
+    WEIGHT_GRAD_BLOCK_N = _QKV_BWD_WEIGHT_GRAD_BLOCK_N
+    WEIGHT_GRAD_BLOCK_K = _QKV_BWD_WEIGHT_GRAD_BLOCK_K
+    WEIGHT_GRAD_BLOCK_M = _QKV_BWD_WEIGHT_GRAD_BLOCK_M
+    WEIGHT_GRAD_NUM_WARPS = _QKV_BWD_WEIGHT_GRAD_NUM_WARPS
+    WEIGHT_GRAD_NUM_STAGES = _QKV_BWD_WEIGHT_GRAD_NUM_STAGES
     if has_value_embedding:
         assert ve_gate_channels <= DX_HAT_BLOCK_K, (
             f"ve_gate_channels={ve_gate_channels} must fit in "
@@ -1214,7 +1271,7 @@ def _norm_qkv_projection_bwd_impl(
     # Phase 1: rematerialize x_norm for backward reuse. We intentionally do
     # not save or materialize raw x_mix in backward; only RMSNorm(x_mix) is
     # reused by later kernels.
-    wrap_triton(_x_norm_from_residual_mix_bwd_kernel)[
+    wrap_triton(_norm_qkv_projection_x_norm_bwd_kernel)[
         (triton.cdiv(M, X_NORM_BLOCK_M), triton.cdiv(K, X_NORM_BLOCK_K))
     ](
         x_base_flat,
@@ -1230,7 +1287,7 @@ def _norm_qkv_projection_bwd_impl(
         num_warps=X_NORM_NUM_WARPS,
     )
     # Phase 2: recover Q/K projection-output grads and optional VE gradients.
-    wrap_triton(_qk_proj_grad_ve_bwd_kernel)[
+    wrap_triton(_norm_qkv_projection_qk_pre_ve_bwd_kernel)[
         (
             triton.cdiv(M, QK_PRE_BLOCK_M),
             n_head + n_kv_head + (n_kv_head if has_value_embedding else 0),
@@ -1281,7 +1338,7 @@ def _norm_qkv_projection_bwd_impl(
         q_weight_for_dx_hat = q_weight
         k_weight_for_dx_hat = k_weight
         v_weight_for_dx_hat = v_weight
-    wrap_triton(_qkv_dx_hat_from_proj_grad_bwd_kernel)[
+    wrap_triton(_norm_qkv_projection_dx_hat_bwd_kernel)[
         (triton.cdiv(M, DX_HAT_BLOCK_M), triton.cdiv(K, DX_HAT_BLOCK_K))
     ](
         d_q_pre,
@@ -1310,7 +1367,7 @@ def _norm_qkv_projection_bwd_impl(
         num_stages=DX_HAT_NUM_STAGES,
     )
     # Phase 4: finish outer RMSNorm input gradient.
-    wrap_triton(_outer_rms_dx_from_dx_hat_bwd_kernel)[
+    wrap_triton(_norm_qkv_projection_outer_rms_dx_bwd_kernel)[
         (triton.cdiv(M, OUTER_RMS_BLOCK_M), triton.cdiv(K, OUTER_RMS_BLOCK_K))
     ](
         x_norm,
@@ -1338,7 +1395,7 @@ def _norm_qkv_projection_bwd_impl(
     d_q_weight = torch.empty_like(q_weight)
     d_k_weight = torch.empty_like(k_weight)
     d_v_weight = torch.empty_like(v_weight)
-    wrap_triton(_qkv_weight_grad_section_bwd_kernel)[
+    wrap_triton(_norm_qkv_projection_weight_section_bwd_kernel)[
         (
             3,
             triton.cdiv(max(q_n, kv_n), WEIGHT_GRAD_BLOCK_N),
@@ -1376,7 +1433,7 @@ def _norm_qkv_projection_bwd_impl(
     )
 
 
-def _qkv_projection_from_x_hat_impl(
+def _norm_qkv_projection_qkv_fwd_impl(
     x_hat: torch.Tensor,
     ve_ids_for_kernel: torch.Tensor,
     ve_weight_for_kernel: torch.Tensor,
@@ -1403,11 +1460,17 @@ def _qkv_projection_from_x_hat_impl(
     v = torch.empty((M, n_kv_head, head_dim), dtype=x_hat.dtype, device=x_hat.device)
     qk_rms_inv = torch.empty((M, n_head + n_kv_head), dtype=torch.float32, device=x_hat.device)
     if has_value_embedding:
-        QKV_BLOCK_M, QKV_BLOCK_K, QKV_NUM_WARPS, QKV_NUM_STAGES = 64, 16, 4, 3
+        QKV_BLOCK_M = _QKV_FWD_VE_BLOCK_M
+        QKV_BLOCK_K = _QKV_FWD_VE_BLOCK_K
+        QKV_NUM_WARPS = _QKV_FWD_VE_NUM_WARPS
+        QKV_NUM_STAGES = _QKV_FWD_VE_NUM_STAGES
     else:
-        QKV_BLOCK_M, QKV_BLOCK_K, QKV_NUM_WARPS, QKV_NUM_STAGES = 128, 32, 4, 1
+        QKV_BLOCK_M = _QKV_FWD_NO_VE_BLOCK_M
+        QKV_BLOCK_K = _QKV_FWD_NO_VE_BLOCK_K
+        QKV_NUM_WARPS = _QKV_FWD_NO_VE_NUM_WARPS
+        QKV_NUM_STAGES = _QKV_FWD_NO_VE_NUM_STAGES
     grid = (triton.cdiv(M, QKV_BLOCK_M), n_head + 2 * n_kv_head)
-    wrap_triton(_qkv_projection_fwd_kernel)[grid](
+    wrap_triton(_norm_qkv_projection_qkv_fwd_kernel)[grid](
         x_hat,
         q_weight,
         k_weight,
@@ -1441,7 +1504,7 @@ def _qkv_projection_from_x_hat_impl(
     return q, k, v, qk_rms_inv
 
 
-def _norm_qkv_projection_residual_mix_fwd_impl(
+def _norm_qkv_projection_with_residual_mix_fwd_impl(
     x: torch.Tensor,
     x0: torch.Tensor,
     resid_scale: torch.Tensor,
@@ -1519,11 +1582,11 @@ def _norm_qkv_projection_residual_mix_fwd_impl(
         ve_gate_channels = 1
 
     norm_block_d = triton.next_power_of_2(K)
-    norm_cfg = _pick_tile_config(M, norm_block_d, n_live_tiles=3)
+    norm_cfg = _pick_fused_add_norm_tile_config(M, norm_block_d, n_live_tiles=3)
     x_mix = torch.empty_like(x_2d)
     x_hat = torch.empty_like(x_2d)
     rms_inv = torch.empty((M,), dtype=torch.float32, device=x.device)
-    wrap_triton(_residual_mix_norm_fwd_kernel)[(triton.cdiv(M, norm_cfg.block_m),)](
+    wrap_triton(_norm_qkv_projection_with_residual_mix_norm_fwd_kernel)[(triton.cdiv(M, norm_cfg.block_m),)](
         x_2d,
         x0_2d,
         resid_scale,
@@ -1539,7 +1602,7 @@ def _norm_qkv_projection_residual_mix_fwd_impl(
         num_warps=norm_cfg.num_warps,
     )
 
-    q, k, v, qk_rms_inv = _qkv_projection_from_x_hat_impl(
+    q, k, v, qk_rms_inv = _norm_qkv_projection_qkv_fwd_impl(
         x_hat,
         ve_ids_for_kernel,
         ve_weight_for_kernel,
@@ -1564,10 +1627,10 @@ def _norm_qkv_projection_residual_mix_fwd_impl(
 
 
 @torch.library.triton_op(
-    "nanoops::norm_qkv_projection_residual_mix_fwd",
+    "nanoops::norm_qkv_projection_with_residual_mix_fwd",
     mutates_args=(),
 )
-def _norm_qkv_projection_residual_mix_fwd_op(
+def _norm_qkv_projection_with_residual_mix_fwd_op(
     x: torch.Tensor,
     x0: torch.Tensor,
     resid_scale: torch.Tensor,
@@ -1599,7 +1662,7 @@ def _norm_qkv_projection_residual_mix_fwd_op(
     Returns internal M-view `(q, k, v, x_mix, rms_inv, qk_rms_inv)`.
     The public wrapper reshapes q/k/v/x_mix back to `(B, T, *)`.
     """
-    return _norm_qkv_projection_residual_mix_fwd_impl(
+    return _norm_qkv_projection_with_residual_mix_fwd_impl(
         x,
         x0,
         resid_scale,
@@ -1622,10 +1685,10 @@ def _norm_qkv_projection_residual_mix_fwd_op(
 
 
 @torch.library.triton_op(
-    "nanoops::norm_qkv_projection_bwd",
+    "nanoops::norm_qkv_projection_with_residual_mix_bwd",
     mutates_args=(),
 )
-def _norm_qkv_projection_bwd_op(
+def _norm_qkv_projection_with_residual_mix_bwd_op(
     d_q: torch.Tensor,
     d_k: torch.Tensor,
     d_v: torch.Tensor,
@@ -1665,7 +1728,7 @@ def _norm_qkv_projection_bwd_op(
 ]:
     """Triton-op backward wrapper.
 
-    Inputs mirror `_norm_qkv_projection_bwd_impl`. This op returns tensors only;
+    Inputs mirror `_norm_qkv_projection_with_residual_mix_bwd_impl`. This op returns tensors only;
     optional gradients are represented by 1-element placeholders because
     `torch.library.triton_op` return values cannot be Optional.
 
@@ -1689,7 +1752,7 @@ def _norm_qkv_projection_bwd_op(
         d_q_weight,
         d_k_weight,
         d_v_weight,
-    ) = _norm_qkv_projection_bwd_impl(
+    ) = _norm_qkv_projection_with_residual_mix_bwd_impl(
         d_q,
         d_k,
         d_v,
@@ -1734,7 +1797,7 @@ def _norm_qkv_projection_bwd_op(
     )
 
 
-def _norm_qkv_projection_residual_mix_setup_context(
+def _norm_qkv_projection_with_residual_mix_setup_context(
     ctx: Any,
     inputs: tuple[
         torch.Tensor,
@@ -1814,7 +1877,7 @@ def _norm_qkv_projection_residual_mix_setup_context(
     ctx.has_value_embedding = ve_ids is not None or ve_weight is not None
 
 
-def _norm_qkv_projection_residual_mix_autograd_backward(
+def _norm_qkv_projection_with_residual_mix_autograd_backward(
     ctx: Any,
     grad_q: torch.Tensor,
     grad_k: torch.Tensor,
@@ -1873,7 +1936,7 @@ def _norm_qkv_projection_residual_mix_autograd_backward(
         d_q_weight,
         d_k_weight,
         d_v_weight,
-    ) = _norm_qkv_projection_bwd_op(
+    ) = _norm_qkv_projection_with_residual_mix_bwd_op(
         grad_q,
         grad_k,
         grad_v,
@@ -1926,9 +1989,9 @@ def _norm_qkv_projection_residual_mix_autograd_backward(
     )
 
 
-_norm_qkv_projection_residual_mix_fwd_op.register_autograd(
-    _norm_qkv_projection_residual_mix_autograd_backward,
-    setup_context=_norm_qkv_projection_residual_mix_setup_context,
+_norm_qkv_projection_with_residual_mix_fwd_op.register_autograd(
+    _norm_qkv_projection_with_residual_mix_autograd_backward,
+    setup_context=_norm_qkv_projection_with_residual_mix_setup_context,
 )
 
 
@@ -1970,7 +2033,7 @@ def norm_qkv_projection_with_residual_mix(
       x_mix: (B, T, K), dtype=x.dtype.
     """
     B, T, K = x.shape
-    q, k, v, x_mix, _rms_inv, _qk_rms_inv = _norm_qkv_projection_residual_mix_fwd_op(
+    q, k, v, x_mix, _rms_inv, _qk_rms_inv = _norm_qkv_projection_with_residual_mix_fwd_op(
         x,
         x0,
         resid_scale,

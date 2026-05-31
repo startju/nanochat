@@ -219,7 +219,7 @@ Summary table (training-shape scale):
 
 **Why this motivates the fusion stack:** standalone RMSNorm kernel
 does ~4·M·D bytes of HBM traffic for ~0 compute return. Fusing norm
-into the adjacent matmul kernel (`fused_mlp_block` on the mlp side)
+into the adjacent matmul kernel (`fused_mlp` on the mlp side)
 keeps the normalized intermediate in registers, saving **4·M·D bytes**
 of HBM traffic (norm output write + matmul input re-read) — pure
 bandwidth win on a bandwidth-bound op. The attn-side
@@ -391,7 +391,7 @@ A **warp** = 32 threads. The fundamental scheduling unit.
 The simplest fused kernel in this repo. It exists purely as a learning
 artifact — nanchat's production blocks fold the RMSNorm directly into
 the adjacent matmul (see `norm_qkv_projection` on the attn side,
-`fused_mlp_block` on the mlp side), so a standalone `add → norm`
+`fused_mlp` on the mlp side), so a standalone `add → norm`
 op boundary doesn't actually appear in the hot path. But every
 pattern this kernel uses is a building block of those bigger fused
 kernels, so it's the cleanest place to learn them.
@@ -423,9 +423,9 @@ one for fwd, plus a 3-kernel backward setup (primary inline kernel
 | Kernel | Grid | Role |
 |---|---|---|
 | `_fused_add_norm_fwd_kernel` | 1D over M | fwd: writes `y` + `summed` + `rms_inv` |
-| `_fused_add_norm_bwd_inline_kernel` | 1D over M | bwd **primary**: full row per tile, inline inner reduction, writes `d_summed` (+ `dnw_partial`) |
-| `_fused_add_norm_inner_kernel` | 1D over M | bwd fallback stage 1: pre-computes `inner[m]` |
-| `_fused_add_norm_bwd_kernel` | 2D over (M, D) | bwd fallback stage 2: writes `d_summed` + `dnw_partial` |
+| `_fused_add_norm_inline_bwd_kernel` | 1D over M | bwd **primary**: full row per tile, inline inner reduction, writes `d_summed` (+ `dnw_partial`) |
+| `_fused_add_norm_inner_bwd_kernel` | 1D over M | bwd fallback stage 1: pre-computes `inner[m]` |
+| `_fused_add_norm_split_bwd_kernel` | 2D over (M, D) | bwd fallback stage 2: writes `d_summed` + `dnw_partial` |
 
 ### 2.1 Forward kernel
 
@@ -495,7 +495,7 @@ on whether the **inline** kernel's per-program tile fits the Ampere
 
 #### The simple thing first: one kernel, full row per program
 
-The primary path is `_fused_add_norm_bwd_inline_kernel`: a 1D grid
+The primary path is `_fused_add_norm_inline_bwd_kernel`: a 1D grid
 over M with `BLOCK_D = next_pow_of_2(D)` so the **full row** lives in
 one tile. The per-row reduction `inner[m] = mean_d(g_eff · y_norm)`
 is then computed in registers — no precompute kernel, no inner HBM
@@ -508,7 +508,7 @@ This works because at typical nanchat shapes the tile is small:
                                                     ≤ 255 regs/thread
 ```
 
-`_pick_tile_config(M, BLOCK_D, n_live_tiles=N)` solves for the largest
+`_pick_fused_add_norm_tile_config(M, BLOCK_D, n_live_tiles=N)` solves for the largest
 BLOCK_M that fits. `N=5` for HAS_NW=True (`y_norm, g_eff, dy_t,
 d_ext, d_summed` alive at peak), `N=4` for HAS_NW=False (`y_norm`
 aliases `src` and `g_eff` aliases `dy_t` when there's no per-channel
@@ -548,14 +548,14 @@ own copy: at `D=1536, BLOCK_D=64` that's a 24× redundant computation.
 Following Flash Attention's pre-compute-reduction pattern, the
 fallback is two kernels:
 
-**Stage 1 — `_fused_add_norm_inner_kernel`** (1D over M, one
+**Stage 1 — `_fused_add_norm_inner_bwd_kernel`** (1D over M, one
 program per `BLOCK_M` rows, processes full D in one tile)
 ```python
 inner[m] = mean_d(g_eff[m, *] * y_norm[m, *])
 # writes (M,) fp32 buffer
 ```
 
-**Stage 2 — `_fused_add_norm_bwd_kernel`** (2D over M × D, each
+**Stage 2 — `_fused_add_norm_split_bwd_kernel`** (2D over M × D, each
 program handles one `(BLOCK_M, BLOCK_D)` output tile)
 ```python
 inner_m = tl.load(inner_ptr + rows)              # single scalar per row, prebuilt
@@ -581,7 +581,7 @@ fixed at 32. With `BLOCK_M=32` at `D=1536, num_warps=4` (128 threads):
 
 **1900 vs 255 cap → catastrophic spill.** So yes, BLOCK_M=32 + full D
 spills. But the inline path notices that BLOCK_M is *also* a free
-parameter — `_pick_tile_config(M, BLOCK_D, n_live_tiles=5)` derives
+parameter — `_pick_fused_add_norm_tile_config(M, BLOCK_D, n_live_tiles=5)` derives
 `BLOCK_M ≤ 1638·nw / BLOCK_D` (= 256 reg/thread cap ÷ 5 tiles, then
 distributed over nw·32 threads) and rounds to a pow-of-2. At D=1536
 that drops BLOCK_M to 4 (regs ≈ 160), at D=4096 to 1 (also ≈ 160).
@@ -621,7 +621,7 @@ All tile-sized kernels here (fwd, bwd inline, fallback inner) share
 one helper for sizing decisions:
 
 ```python
-def _pick_tile_config(M, BLOCK_D, n_live_tiles) -> TileConfig:
+def _pick_fused_add_norm_tile_config(M, BLOCK_D, n_live_tiles) -> TileConfig:
     # Register-budget model (Ampere 255 fp32 reg/thread spill cap):
     #     regs/thread ≈ n_live_tiles × (BLOCK_M × BLOCK_D) / (nw × 32)
     # At the 256-reg target: tile ≤ (8192 / n_live_tiles) × nw
@@ -662,11 +662,11 @@ next_pow2(1638·4/2048)) = min(32, 4) = 4. tile = 8K. nw = next_pow2(8K/1638) = 
 → `BLOCK_M=4, nw=8`, ~160 reg/thread. Grid = cdiv(2048, 4) = 512.
 
 **2-kernel bwd fallback**: uses **fixed config** `BLOCK_M=32, BLOCK_D=64,
-num_warps=4` instead of `_pick_tile_config`. Reason isn't perf
+num_warps=4` instead of `_pick_fused_add_norm_tile_config`. Reason isn't perf
 (autotune's picks were similar); it's that Triton's autotune dispatch
 path retains some operations that don't survive CUDA Graph stream
 capture. Hard-coding makes the fallback graph-friendly. Only the
-inner pre-compute kernel uses `_pick_tile_config` (with n_live=2).
+inner pre-compute kernel uses `_pick_fused_add_norm_tile_config` (with n_live=2).
 
 ### 2.5 Numerical precision
 
@@ -798,7 +798,7 @@ HBM buffer. `d_summed_external` is folded into the kernel's d_summed
 store via a register-level add — same trick as the 2-kernel path:
 
 ```
-_fused_add_norm_bwd_inline_kernel:
+_fused_add_norm_inline_bwd_kernel:
   read summed/y            M·D
   read dy                  M·D
   read d_summed_external   M·D
@@ -829,12 +829,12 @@ a full row — so we read `summed`/`dy` twice (once in inner, once
 in bwd):
 
 ```
-_fused_add_norm_inner_kernel:
+_fused_add_norm_inner_bwd_kernel:
   read summed/y            M·D
   read dy                  M·D
   write inner_buf          ~0  (M floats)                   ─┐ subtotal 2·M·D
                                                              │
-_fused_add_norm_bwd_kernel:                                  │
+_fused_add_norm_split_bwd_kernel:                                  │
   read summed/y            M·D   ← repeat read (L2 likely hits)
   read dy                  M·D   ← repeat read (L2 likely hits)
   read d_summed_external   M·D
@@ -909,14 +909,14 @@ even if their per-element throughput isn't faster than a chain of
 small kernels.
 
 That's also why nanchat's production path mostly skips this standalone
-op-boundary kernel: `fused_mlp_block` folds norm directly into its
+op-boundary kernel: `fused_mlp` folds norm directly into its
 matmul path, and `norm_qkv_projection` reuses only the RMSNorm
 materialization sub-kernel before its Q/K/V projection. The bigger
 production kernels are where these patterns pay off.
 
 ---
 
-## Chapter 3 — `fused_mlp_block`: production-level, fwd+bwd all Triton
+## Chapter 3 — `fused_mlp`: production-level, fwd+bwd all Triton
 
 Chapter 2's `FusedAddNorm` was a teaching artifact. This chapter is
 nanchat's actual mlp-side fusion target — the standard transformer
@@ -934,7 +934,7 @@ y = x + relu²(RMSNorm(x) @ W_fc.T) @ W_proj.T
 
 API:
 ```python
-def fused_mlp_block(x, fc_weight, proj_weight, eps=1e-6) -> y
+def fused_mlp(x, fc_weight, proj_weight, eps=1e-6) -> y
 #   x, fc_weight, and proj_weight must be contiguous CUDA tensors
 #   RMSNorm is plain no-affine; there is no Python norm_weight argument.
 ```
@@ -952,13 +952,13 @@ The matmul itself is compute-bound, but each bwd step
 
 | Stage | Kernel | Grid | Role |
 |---|---|---|---|
-| Fwd 0 | `_rms_norm_fwd_kernel` | 1D over M | Plain RMSNorm computes `x_hat` + side-output `rms_inv` |
-| Fwd 1 | `_cast_matmul_kernel` | 2D over (M, N_fc) | `z = x_hat @ W_fc.T`, W_fc cast inline at load |
-| Fwd 2 | `_relu_sq_linear_residual_fwd_kernel` | 2D over (M, K_out) | relu² + c_proj + outer residual add → `y` |
-| Bwd A | `_mlp_dz_bwd_kernel` | 2D over (M, N_fc) | `dz` + side-output `inner_buf` (D needs it) |
-| Bwd B | `_mlp_dW_proj_bwd_kernel` | 2D over (K_out, N_fc) | `dW_proj` (fp32 master output) |
-| Bwd C | `_mlp_dW_fc_bwd_kernel` | 2D over (N_fc, K) | `dW_fc` (fp32 master output) |
-| Bwd D | `_mlp_dx_bwd_kernel` | 2D over (M, K) | `dx_hat` matmul + no-affine RMSNorm bwd + outer residual fold → `dx` |
+| Fwd 0 | `_fused_mlp_rms_norm_fwd_kernel` | 1D over M | Plain RMSNorm computes `x_hat` + side-output `rms_inv` |
+| Fwd 1 | `_fused_mlp_fc_matmul_fwd_kernel` | 2D over (M, N_fc) | `z = x_hat @ W_fc.T`, W_fc cast inline at load |
+| Fwd 2 | `_fused_mlp_proj_residual_fwd_kernel` | 2D over (M, K_out) | relu² + c_proj + outer residual add → `y` |
+| Bwd A | `_fused_mlp_dz_bwd_kernel` | 2D over (M, N_fc) | `dz` + side-output `inner_buf` (D needs it) |
+| Bwd B | `_fused_mlp_dproj_weight_bwd_kernel` | 2D over (K_out, N_fc) | `dW_proj` (fp32 master output) |
+| Bwd C | `_fused_mlp_dfc_weight_bwd_kernel` | 2D over (N_fc, K) | `dW_fc` (fp32 master output) |
+| Bwd D | `_fused_mlp_dx_bwd_kernel` | 2D over (M, K) | `dx_hat` matmul + no-affine RMSNorm bwd + outer residual fold → `dx` |
 
 **All-Triton fwd/bwd is intentional**. At d24 shape (M=2048,
 N_fc=6144, K=1536), every matmul can fuse one HBM round-trip or one
@@ -973,11 +973,11 @@ cast folded into the load. See §3.4.
 
 #### 3.2.1 Step 0 — no-affine RMSNorm
 
-The fwd runs a small local `_rms_norm_fwd_kernel`:
+The fwd runs a small local `_fused_mlp_rms_norm_fwd_kernel`:
 
 ```python
-# Step 0 caller (_fused_mlp_block_fwd_impl)
-_rms_norm_fwd_kernel[...](
+# Step 0 caller (_fused_mlp_fwd_impl)
+_fused_mlp_rms_norm_fwd_kernel[...](
     x,
     x_hat,
     rms_inv,
@@ -1000,7 +1000,7 @@ This is deliberately no-affine: nanchat's RMSNorm has no learnable
 per-channel scale on the hot path, and the Python API no longer accepts
 one.
 
-#### 3.2.2 Step 1 — `_cast_matmul_kernel`: c_fc + inline weight cast
+#### 3.2.2 Step 1 — `_fused_mlp_fc_matmul_fwd_kernel`: c_fc + inline weight cast
 
 c_fc is an isolated large matmul on its own — no neighboring
 elementwise byproduct to fuse into the matmul's register stage.
@@ -1020,7 +1020,7 @@ goes Triton too:
 
 ```python
 @triton.jit
-def _cast_matmul_kernel(x_ptr, w_ptr, z_ptr, M, N, K, ...):
+def _fused_mlp_fc_matmul_fwd_kernel(x_ptr, w_ptr, z_ptr, M, N, K, ...):
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     for k_start in range(0, K, BLOCK_K):
         x_tile = tl.load(x_ptr + ...)                  # bf16
@@ -1042,7 +1042,7 @@ st=2)` — single kernel ~639 μs, slightly beating cuBLAS+cast at
 = 40 KB`, ×2 stages = 80 KB, within the 100 KB SM budget on 3090, so
 the same config is safe for parity tests too.
 
-#### 3.2.3 Step 2 — `_relu_sq_linear_residual_fwd_kernel`
+#### 3.2.3 Step 2 — `_fused_mlp_proj_residual_fwd_kernel`
 
 Three ops — `relu²(z) @ W_proj.T + x` — packed into one Triton
 kernel:
@@ -1088,7 +1088,7 @@ C reduces M, D reduces N_fc), so **packing them into a single kernel
 isn't possible**. But each step fuses one HBM round-trip with an
 adjacent elementwise op.
 
-#### 3.3.1 Step A — `_mlp_dz_bwd_kernel`: matmul + relu² bwd + side-output
+#### 3.3.1 Step A — `_fused_mlp_dz_bwd_kernel`: matmul + relu² bwd + side-output
 
 Math:
 ```
@@ -1190,7 +1190,7 @@ atomic_add wins because dz/z are already in registers, the target
 buffer (M,) lives in L2, no extra buffer, no extra launch.
 **Self-contained inside the kernel**.
 
-#### 3.3.2 Step B — `_mlp_dW_proj_bwd_kernel`: dy.T @ relu²(z)
+#### 3.3.2 Step B — `_fused_mlp_dproj_weight_bwd_kernel`: dy.T @ relu²(z)
 
 ```python
 acc = tl.zeros((BLOCK_K_OUT, BLOCK_N), dtype=tl.float32)
@@ -1223,7 +1223,7 @@ Note B is the only matmul in this group that doesn't need an inline
 weight cast — dy and z are both already bf16 (caller passes bf16,
 not fp32 master), there's nothing to cast.
 
-#### 3.3.3 Step C — `_mlp_dW_fc_bwd_kernel`: dz.T @ x_hat, x_hat recomputed
+#### 3.3.3 Step C — `_fused_mlp_dfc_weight_bwd_kernel`: dz.T @ x_hat, x_hat recomputed
 
 ```python
 acc = tl.zeros((BLOCK_N, BLOCK_K), dtype=tl.float32)
@@ -1259,7 +1259,7 @@ that C's matmul inputs are `dz_tile (bf16)` and `x_hat (fp32 register)`,
 so the cast direction is `x_hat.to(bf16)`, not the usual weight cast
 — but the effect is identical (bf16 tile feeds the tensor cores).
 
-#### 3.3.4 Step D — `_mlp_dx_bwd_kernel`: dx all-sources merge
+#### 3.3.4 Step D — `_fused_mlp_dx_bwd_kernel`: dx all-sources merge
 
 x appears twice in the forward:
 ```
@@ -1352,7 +1352,7 @@ to be promoted, the final add happens in bf16.
 
 | Op | Owner | Why |
 |---|---|---|
-| Fwd c_fc matmul (z = x_hat @ W_fc) | Triton (`_cast_matmul_kernel`) | fp32→bf16 weight cast folded into load, saves 36 MB HBM round-trip + 1 launch, beats cuBLAS's ~10-15% efficiency edge |
+| Fwd c_fc matmul (z = x_hat @ W_fc) | Triton (`_fused_mlp_fc_matmul_fwd_kernel`) | fp32→bf16 weight cast folded into load, saves 36 MB HBM round-trip + 1 launch, beats cuBLAS's ~10-15% efficiency edge |
 | Fwd relu² + c_proj + residual | Triton | three ops fused, r never to HBM; proj_w also cast inline |
 | Fwd RMSNorm | Triton | local no-affine RMSNorm kernel writes x_hat + rms_inv |
 | Bwd dz (A) | Triton | matmul + relu² bwd + atomic_add side-output, three in one; proj_w cast inline |
@@ -1525,9 +1525,9 @@ Observations:
 
 ### 3.8 End-to-end landing
 
-`fused_mlp_block` wins ~9% single-op fwd+bwd at d24 (micro-bench; higher
+`fused_mlp` wins ~9% single-op fwd+bwd at d24 (micro-bench; higher
 after cast fusion). Landing into nanchat training is via the
-`NANOOPS_FUSED_MLP_BLOCK=1` environment variable; `nanoops/integration.py`'s
+`NANOOPS_FUSED_MLP=1` environment variable; `nanoops/integration.py`'s
 `patch_nanchat()` monkey-patches `nanchat.gpt.Block.forward` on the
 mlp side:
 
@@ -1538,7 +1538,7 @@ def _patched_block_forward(self, x, ve, cos_sin, window_size, kv_cache):
         return x + self.mlp(_orig_norm(x))          # CPU / kv-cache fallback
     B, T, C = x.shape
     x_2d = x.reshape(B * T, C).contiguous()
-    y_2d = _fused_mlp_block(x_2d, self.mlp.c_fc.weight, self.mlp.c_proj.weight)
+    y_2d = _fused_mlp(x_2d, self.mlp.c_fc.weight, self.mlp.c_proj.weight)
     return y_2d.reshape(B, T, C)
 ```
 
@@ -1546,7 +1546,7 @@ The fused block always uses nanchat's no-affine RMSNorm; `_orig_norm`
 is the original `Block.norm`, captured in a module global at patch time.
 
 **Single-op gain doesn't translate 1:1 to end-to-end gain**, but
-`fused_mlp_block` is now wrapped as `torch.library.custom_op` (paired
+`fused_mlp` is now wrapped as `torch.library.custom_op` (paired
 fwd/bwd, plus `register_fake` + `register_autograd`). torch.compile
 treats it as an opaque FX node — **no graph break, no FakeTensor
 tracing into the Triton kernels**, and Inductor keeps fusing on both
@@ -1564,7 +1564,7 @@ checkpoint resume, 2× 3090):
 
 | Path | dt (ms) | tok/sec | bf16_mfu (%) | vs baseline |
 |---|---:|---:|---:|---:|
-| baseline (no FUSED_MLP_BLOCK) | 67,175 | 15,610 | 52.49 | — |
+| baseline (no FUSED_MLP) | 67,175 | 15,610 | 52.49 | — |
 | FUSED + `autograd.Function` (old) | 65,452 | 16,021 | 53.88 | +2.63% |
 | FUSED + `custom_op` (current) | **65,038** | **16,124** | **54.22** | **+3.29%** |
 

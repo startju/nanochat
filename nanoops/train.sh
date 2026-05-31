@@ -47,7 +47,7 @@ export NANOOPS_OFFLOAD_OPTIM="${NANOOPS_OFFLOAD_OPTIM:-1}"
 # trick needed to fit d24+B=1 on a single 24 GiB GPU. Opt out with
 # empty value.
 export NANOOPS_L_ATTN_CHECKPOINT="${NANOOPS_L_ATTN_CHECKPOINT:-1}"
-# FusedMLPBlock ON by default — swaps `nanchat.gpt.Block.forward`'s
+# FusedMLP ON by default — swaps `nanchat.gpt.Block.forward`'s
 # `x + mlp(norm(x))` path with a single autograd.Function that runs the
 # whole RMSNorm + c_fc + relu² + c_proj + residual in 3 fused Triton
 # kernels fwd / 4 fused Triton kernels bwd (no cuBLAS). All weight casts
@@ -56,7 +56,7 @@ export NANOOPS_L_ATTN_CHECKPOINT="${NANOOPS_L_ATTN_CHECKPOINT:-1}"
 # loss parity at 5-step resume; full op-level micro-bench is ~+9% but
 # torch.compile black-box dilutes that. Opt out with empty value.
 # CPU / kv-cache fallback already wired in _patched_block_forward.
-export NANOOPS_FUSED_MLP_BLOCK="${NANOOPS_FUSED_MLP_BLOCK:-1}"
+export NANOOPS_FUSED_MLP="${NANOOPS_FUSED_MLP:-1}"
 # Fused attention QKV ON by default — swaps the training trunk through
 # GPT.forward so outer RMSNorm + Q/K/V projection + rotary + QK norm + VE
 # lookup run in the custom Triton op. Empty value disables it for A/B runs.

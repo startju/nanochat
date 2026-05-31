@@ -1,6 +1,6 @@
-"""FusedMLPBlock Triton kernels — standard transformer mlp side fused
+"""FusedMLP Triton kernels — standard transformer mlp side fused
 as `y = x + relu²(norm(x) @ W_fc.T) @ W_proj.T`, with 3 fwd
-steps + 4 bwd steps in Triton. See `fused_mlp_block` and TRITON_zh.md
+steps + 4 bwd steps in Triton. See `fused_mlp` and TRITON_zh.md
 Chapter 3.
 """
 
@@ -11,7 +11,7 @@ from typing import Any
 import torch
 from torch.library import wrap_triton
 
-from .triton_fused_add_norm import _pick_tile_config
+from .triton_fused_add_norm import _pick_fused_add_norm_tile_config
 
 try:
     import triton
@@ -22,8 +22,51 @@ except ImportError:
     _HAS_TRITON = False
 
 
+# d24 compile-path tuning constants. Benchmark harnesses can monkeypatch these
+# before torch.compile; defaults preserve the checked-in path.
+_MLP_FWD_FC_BLOCK_M = 128
+_MLP_FWD_FC_BLOCK_N = 64
+_MLP_FWD_FC_BLOCK_K = 32
+_MLP_FWD_FC_NUM_WARPS = 4
+_MLP_FWD_FC_NUM_STAGES = 3
+
+_MLP_FWD_PROJ_BLOCK_M = 128
+_MLP_FWD_PROJ_BLOCK_K_OUT = 64
+_MLP_FWD_PROJ_BLOCK_N = 32
+_MLP_FWD_PROJ_NUM_WARPS = 4
+_MLP_FWD_PROJ_NUM_STAGES = 3
+
+_MLP_BWD_DZ_BLOCK_M = 128
+_MLP_BWD_DZ_BLOCK_N = 64
+_MLP_BWD_DZ_BLOCK_K_OUT = 32
+_MLP_BWD_DZ_NUM_WARPS = 4
+_MLP_BWD_DZ_NUM_STAGES = 3
+
+_MLP_BWD_DW_PROJ_BLOCK_K_OUT = 64
+_MLP_BWD_DW_PROJ_BLOCK_N = 64
+_MLP_BWD_DW_PROJ_BLOCK_M = 32
+_MLP_BWD_DW_PROJ_NUM_WARPS = 4
+_MLP_BWD_DW_PROJ_NUM_STAGES = 2
+
+_MLP_BWD_DW_FC_BLOCK_M = 32
+_MLP_BWD_DW_FC_BLOCK_N = 128
+_MLP_BWD_DW_FC_BLOCK_K = 64
+_MLP_BWD_DW_FC_NUM_WARPS = 4
+_MLP_BWD_DW_FC_NUM_STAGES = 2
+
+_MLP_BWD_DX_BLOCK_M = 128
+_MLP_BWD_DX_BF16_BLOCK_K = 64
+_MLP_BWD_DX_BF16_BLOCK_N = 64
+_MLP_BWD_DX_BF16_NUM_WARPS = 4
+_MLP_BWD_DX_BF16_NUM_STAGES = 2
+_MLP_BWD_DX_FP32_BLOCK_K = 64
+_MLP_BWD_DX_FP32_BLOCK_N = 64
+_MLP_BWD_DX_FP32_NUM_WARPS = 8
+_MLP_BWD_DX_FP32_NUM_STAGES = 3
+
+
 # ─────────────────────────────────────────────────────────────────────
-# Fused MLP block + outer residual — standard transformer mlp side:
+# Fused MLP + outer residual — standard transformer mlp side:
 #     y = x + relu(RMSNorm(x) @ W_fc.T)² @ W_proj.T
 #
 # Public Python API keeps the transformer shape `(B, T, K)`. The public wrapper
@@ -38,14 +81,14 @@ except ImportError:
 #     mlp[m, p]    = sum_n r[m, n] * W_proj[p, n]                     (Linear: c_proj)
 #     y[m, p]      = x[m, p] + mlp[m, p]                              (Residual add)
 #
-# See `fused_mlp_block` and the impl helper docstrings for the kernel
+# See `fused_mlp` and the impl helper docstrings for the kernel
 # breakdown (3-step fwd, 4-step Triton bwd) and saved-state details.
 # ─────────────────────────────────────────────────────────────────────
 
 
 if _HAS_TRITON:
     @triton.jit
-    def _rms_norm_fwd_kernel(
+    def _fused_mlp_rms_norm_fwd_kernel(
         x_ptr,  # (M, K) activation dtype
         x_hat_ptr,  # (M, K) activation dtype — out: RMSNorm(x)
         rms_inv_ptr,  # (M,) fp32 — out
@@ -84,7 +127,7 @@ if _HAS_TRITON:
     # (36 MB write+read at d24).
     # d24 config locked: (BLOCK_M=128, BLOCK_N=64, BLOCK_K=32, nw=4, st=3).
     @triton.jit
-    def _cast_matmul_kernel(
+    def _fused_mlp_fc_matmul_fwd_kernel(
         x_ptr,  # (M, K) bf16
         w_ptr,  # (N, K) fp32 (cast to x's dtype on load)
         z_ptr,  # (M, N) bf16 — output
@@ -137,7 +180,7 @@ if _HAS_TRITON:
     # (autotune dispatch isn't CUDA Graph capture-friendly); d24 winner
     # locked: (BLOCK_M=128, BLOCK_K_OUT=64, BLOCK_N=32, nw=4, st=3).
     @triton.jit
-    def _relu_sq_linear_residual_fwd_kernel(
+    def _fused_mlp_proj_residual_fwd_kernel(
         z_ptr,  # (M, N) activation dtype — c_fc output
         proj_w_ptr,  # (K_out, N) fp32 master or activation dtype — c_proj weight
         residual_ptr,  # (M, K_out) activation dtype — residual stream x
@@ -197,10 +240,10 @@ if _HAS_TRITON:
         tl.store(y_ptr + offs, y, mask=mask_2d)
 
     # dz bwd for the c_proj + relu² + residual_add fwd op
-    # (`_relu_sq_linear_residual_fwd_kernel`). The other bwd outputs of
+    # (`_fused_mlp_proj_residual_fwd_kernel`). The other bwd outputs of
     # that fwd are split off:
-    #   dW_proj          → `_mlp_dW_proj_bwd_kernel` (different reduction axis)
-    #   d_residual = dy  → folded into dx by `_mlp_dx_bwd_kernel`'s outer-residual pass
+    #   dW_proj          → `_fused_mlp_dproj_weight_bwd_kernel` (different reduction axis)
+    #   d_residual = dy  → folded into dx by `_fused_mlp_dx_bwd_kernel`'s outer-residual pass
     # This kernel produces only dz, plus the inner_buf side-output for D.
     #
     # Math:
@@ -227,7 +270,7 @@ if _HAS_TRITON:
     # atomic_add here keeps everything self-contained in this kernel.
     # d24 config locked: (BLOCK_M=128, BLOCK_N=64, BLOCK_K_OUT=32, nw=4, st=3).
     @triton.jit
-    def _mlp_dz_bwd_kernel(
+    def _fused_mlp_dz_bwd_kernel(
         dy_ptr,  # (M, K_out) bf16 — gradient w.r.t. y
         z_ptr,  # (M, N) bf16 — saved from fwd
         proj_w_ptr,  # (K_out, N) fp32 master or bf16 — W_proj (cast to dy.dtype on load)
@@ -295,12 +338,12 @@ if _HAS_TRITON:
         tl.atomic_add(inner_buf_ptr + rows, inner_partial, mask=row_mask)
 
     # dW_proj = dy.T @ relu²(z), r recomputed inline (no materialization).
-    # Pairs with `_mlp_dz_bwd_kernel` to cover both bwd outputs of the
-    # fwd kernel `_relu_sq_linear_residual_fwd_kernel`; reduction axis
+    # Pairs with `_fused_mlp_dz_bwd_kernel` to cover both bwd outputs of the
+    # fwd kernel `_fused_mlp_proj_residual_fwd_kernel`; reduction axis
     # differs (M here vs K_out there) so they're separate kernels.
     # d24 config locked: (BLOCK_K_OUT=64, BLOCK_N=64, BLOCK_M=32, nw=4, st=2).
     @triton.jit
-    def _mlp_dW_proj_bwd_kernel(
+    def _fused_mlp_dproj_weight_bwd_kernel(
         dy_ptr,  # (M, K_out) bf16
         z_ptr,  # (M, N) bf16 — saved from fwd
         dW_proj_ptr,  # (K_out, N) — output (dtype = W_proj.dtype, typically fp32 master)
@@ -359,7 +402,7 @@ if _HAS_TRITON:
     # d24 config locked: (BLOCK_M=32, BLOCK_N=128, BLOCK_K=64, nw=4, st=2).
     # Other shapes can prefer (BLOCK_N=64, BLOCK_K=128), within ~5% on 3090.
     @triton.jit
-    def _mlp_dW_fc_bwd_kernel(
+    def _fused_mlp_dfc_weight_bwd_kernel(
         dz_ptr,  # (M, N_fc) bf16
         x_ptr,  # (M, K) bf16 — fwd input, source for x_hat recompute
         rms_inv_ptr,  # (M,) fp32
@@ -427,7 +470,7 @@ if _HAS_TRITON:
     #   inner    = inner_buf                    (A already divided by norm_dim)
     #   dx       = rms_inv · (g_eff - y_norm · inner) + dy  (outer residual passthrough)
     @triton.jit
-    def _mlp_dx_bwd_kernel(
+    def _fused_mlp_dx_bwd_kernel(
         dz_ptr,  # (M, N_fc) bf16
         W_fc_ptr,  # (N_fc, K) fp32 master or bf16 — cast to dz.dtype on load
         x_ptr,  # (M, K) bf16 — fwd input, used for y_norm = x·rms_inv
@@ -498,13 +541,13 @@ if _HAS_TRITON:
         tl.store(dx_ptr + offs, dx, mask=mask_2d)
 
 
-def _fused_mlp_block_fwd_impl(
+def _fused_mlp_fwd_impl(
     x: torch.Tensor,
     fc_weight: torch.Tensor,
     proj_weight: torch.Tensor,
     eps: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Forward kernel sequence for FusedMLPBlock. Returns (y, rms_inv, z);
+    """Forward kernel sequence for FusedMLP. Returns (y, rms_inv, z);
     rms_inv and z are saved for the backward pass.
 
     Args:
@@ -529,14 +572,14 @@ def _fused_mlp_block_fwd_impl(
         y     = x + mlp                             (Residual add)
 
     Three steps:
-      0. `_rms_norm_fwd_kernel` — produces x_hat + rms_inv.
-      1. `_cast_matmul_kernel` — z = x_hat @ W_fc.T with the fp32→x.dtype
+      0. `_fused_mlp_rms_norm_fwd_kernel` — produces x_hat + rms_inv.
+      1. `_fused_mlp_fc_matmul_fwd_kernel` — z = x_hat @ W_fc.T with the fp32→x.dtype
          weight cast fused into the matmul load (no bf16 weight tile to
          HBM).
-      2. `_relu_sq_linear_residual_fwd_kernel` — relu² + c_proj +
+      2. `_fused_mlp_proj_residual_fwd_kernel` — relu² + c_proj +
          residual_add(x) → y in one Triton pass."""
     if not _HAS_TRITON:
-        raise RuntimeError("fused_mlp_block requires triton to be installed")
+        raise RuntimeError("fused_mlp requires triton to be installed")
     assert x.is_cuda and x.is_contiguous()
     assert fc_weight.is_cuda and fc_weight.is_contiguous()
     assert proj_weight.is_cuda and proj_weight.is_contiguous()
@@ -553,10 +596,10 @@ def _fused_mlp_block_fwd_impl(
     # Step 0: no-affine RMSNorm. Step 2 / bwd consume x directly as the
     # residual stream.
     BLOCK_D_NORM = triton.next_power_of_2(K)
-    norm_cfg = _pick_tile_config(M, BLOCK_D_NORM, n_live_tiles=2)
+    norm_cfg = _pick_fused_add_norm_tile_config(M, BLOCK_D_NORM, n_live_tiles=2)
     x_hat = torch.empty_like(x)
     rms_inv = torch.empty((M,), dtype=torch.float32, device=x.device)
-    wrap_triton(_rms_norm_fwd_kernel)[(triton.cdiv(M, norm_cfg.block_m),)](
+    wrap_triton(_fused_mlp_rms_norm_fwd_kernel)[(triton.cdiv(M, norm_cfg.block_m),)](
         x,
         x_hat,
         rms_inv,
@@ -568,17 +611,19 @@ def _fused_mlp_block_fwd_impl(
         num_warps=norm_cfg.num_warps,
     )
 
-    # Step 1: c_fc via `_cast_matmul_kernel` — Triton matmul that
+    # Step 1: c_fc via `_fused_mlp_fc_matmul_fwd_kernel` — Triton matmul that
     # loads fc_weight (fp32 master typical) in native dtype and casts
     # inline. Replaces `torch.matmul(x_hat, fc_weight.t())` to avoid
     # materializing a bf16 cast weight tile.
     # d24 compile-path sweep winner (bf16): (BM=128, BN=64, BK=32, nw=4,
     # st=3). This beats the older (256,64,32,nw=8,st=2) by ~8% on the
     # isolated kernel and avoids over-subscribing registers.
-    BLOCK_M_S1, BLOCK_N_S1, BLOCK_K_S1 = 128, 64, 32
+    BLOCK_M_S1 = _MLP_FWD_FC_BLOCK_M
+    BLOCK_N_S1 = _MLP_FWD_FC_BLOCK_N
+    BLOCK_K_S1 = _MLP_FWD_FC_BLOCK_K
     z = torch.empty((M, N_fc), dtype=x.dtype, device=x.device)
     grid_s1 = (triton.cdiv(M, BLOCK_M_S1), triton.cdiv(N_fc, BLOCK_N_S1))
-    wrap_triton(_cast_matmul_kernel)[grid_s1](
+    wrap_triton(_fused_mlp_fc_matmul_fwd_kernel)[grid_s1](
         x_hat,
         fc_weight,
         z,
@@ -589,17 +634,19 @@ def _fused_mlp_block_fwd_impl(
         BLOCK_N=BLOCK_N_S1,
         BLOCK_K=BLOCK_K_S1,
         IEEE_PRECISION=ieee,
-        num_warps=4,
-        num_stages=3,
+        num_warps=_MLP_FWD_FC_NUM_WARPS,
+        num_stages=_MLP_FWD_FC_NUM_STAGES,
     )
 
     # Step 2: Triton kernel for relu² + c_proj + outer residual (= x).
     # d24 compile-path sweep winner: (BM=128, BKO=64, BN=32, nw=4, st=3),
     # about 10% faster than the older nw=8/st=2 setting.
-    BLOCK_M_FWD, BLOCK_K_OUT_FWD, BLOCK_N_FWD = 128, 64, 32
+    BLOCK_M_FWD = _MLP_FWD_PROJ_BLOCK_M
+    BLOCK_K_OUT_FWD = _MLP_FWD_PROJ_BLOCK_K_OUT
+    BLOCK_N_FWD = _MLP_FWD_PROJ_BLOCK_N
     y = torch.empty((M, K_proj_out), dtype=x.dtype, device=x.device)
     grid = (triton.cdiv(M, BLOCK_M_FWD), triton.cdiv(K_proj_out, BLOCK_K_OUT_FWD))
-    wrap_triton(_relu_sq_linear_residual_fwd_kernel)[grid](
+    wrap_triton(_fused_mlp_proj_residual_fwd_kernel)[grid](
         z,
         proj_weight,
         x,
@@ -611,13 +658,13 @@ def _fused_mlp_block_fwd_impl(
         BLOCK_K_OUT=BLOCK_K_OUT_FWD,
         BLOCK_N=BLOCK_N_FWD,
         IEEE_PRECISION=ieee,
-        num_warps=4,
-        num_stages=3,
+        num_warps=_MLP_FWD_PROJ_NUM_WARPS,
+        num_stages=_MLP_FWD_PROJ_NUM_STAGES,
     )
     return y, rms_inv, z
 
 
-def _fused_mlp_block_bwd_impl(
+def _fused_mlp_bwd_impl(
     dy: torch.Tensor,
     x: torch.Tensor,
     fc_weight: torch.Tensor,
@@ -625,7 +672,7 @@ def _fused_mlp_block_bwd_impl(
     rms_inv: torch.Tensor,
     z: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Backward implementation for FusedMLPBlock. Returns
+    """Backward implementation for FusedMLP. Returns
     (dx, dW_fc, dW_proj).
 
     Args:
@@ -642,17 +689,17 @@ def _fused_mlp_block_bwd_impl(
       dW_proj: (K, N_fc), dtype=proj_weight.dtype.
 
     Four Triton kernels:
-      A. `_mlp_dz_bwd_kernel` — dz = 2·relu(z) · (dy @ W_proj). Side-output
+      A. `_fused_mlp_dz_bwd_kernel` — dz = 2·relu(z) · (dy @ W_proj). Side-output
          `inner_buf[m] = Σ_n(dz·z) / norm_dim` via atomic_add (free —
          dz/z in registers; division folded in since K_out == norm_dim in
          MLP). Step D uses it via the identity Σ_k(dx_hat·x_hat) =
          Σ_n(dz·z) to skip its K-reduction.
-      B. `_mlp_dW_proj_bwd_kernel` — dW_proj = dy.T @ relu²(z) (r
+      B. `_fused_mlp_dproj_weight_bwd_kernel` — dW_proj = dy.T @ relu²(z) (r
          recomputed inline; output dtype = W_proj.dtype master).
-      C. `_mlp_dW_fc_bwd_kernel` — dW_fc = dz.T @ x_hat (x_hat
+      C. `_fused_mlp_dfc_weight_bwd_kernel` — dW_fc = dz.T @ x_hat (x_hat
          reconstructed from x and rms_inv inline; output dtype =
          W_fc.dtype master).
-      D. `_mlp_dx_bwd_kernel` — dx in one fused pass.
+      D. `_fused_mlp_dx_bwd_kernel` — dx in one fused pass.
          x has TWO gradient paths in `y = x + mlp(norm(x))`:
            (i)  outer-residual: dx ← dy   (direct passthrough)
            (ii) norm path:      dx ← RMSNorm_bwd(dx_hat),
@@ -664,7 +711,7 @@ def _fused_mlp_block_bwd_impl(
          never written to HBM; (i)'s `+ dy` is folded into the store.
          Safe because kernel C uses x_hat, not dx_hat."""
     if not _HAS_TRITON:
-        raise RuntimeError("fused_mlp_block backward requires triton to be installed")
+        raise RuntimeError("fused_mlp backward requires triton to be installed")
     M, K = x.shape
     N_fc = fc_weight.shape[0]
     K_out = proj_weight.shape[0]
@@ -673,11 +720,13 @@ def _fused_mlp_block_bwd_impl(
 
     # A: dz + inner_buf side-output via atomic_add.
     # d24 sweep winner: (BM=128, BN=64, BKO=32, nw=4, st=3).
-    BLOCK_M_A, BLOCK_N_A, BLOCK_K_OUT_A = 128, 64, 32
+    BLOCK_M_A = _MLP_BWD_DZ_BLOCK_M
+    BLOCK_N_A = _MLP_BWD_DZ_BLOCK_N
+    BLOCK_K_OUT_A = _MLP_BWD_DZ_BLOCK_K_OUT
     dz = torch.empty_like(z)
     inner_buf = torch.zeros((M,), dtype=torch.float32, device=z.device)
     grid_a = (triton.cdiv(M, BLOCK_M_A), triton.cdiv(N_fc, BLOCK_N_A))
-    wrap_triton(_mlp_dz_bwd_kernel)[grid_a](
+    wrap_triton(_fused_mlp_dz_bwd_kernel)[grid_a](
         dy,
         z,
         proj_weight,
@@ -690,18 +739,20 @@ def _fused_mlp_block_bwd_impl(
         BLOCK_N=BLOCK_N_A,
         BLOCK_K_OUT=BLOCK_K_OUT_A,
         IEEE_PRECISION=ieee,
-        num_warps=4,
-        num_stages=3,
+        num_warps=_MLP_BWD_DZ_NUM_WARPS,
+        num_stages=_MLP_BWD_DZ_NUM_STAGES,
     )
 
     # B: dW_proj = dy.T @ relu²(z), r recomputed inline.
     # Output dtype = proj_weight.dtype (fp32 master typical), so the
     # gradient lands directly on the master weight without a downstream
     # .to() cast. d24 sweep winner: (BKO=64, BN=64, BM=32, nw=4, st=2).
-    BLOCK_K_OUT_B, BLOCK_N_B, BLOCK_M_B = 64, 64, 32
+    BLOCK_K_OUT_B = _MLP_BWD_DW_PROJ_BLOCK_K_OUT
+    BLOCK_N_B = _MLP_BWD_DW_PROJ_BLOCK_N
+    BLOCK_M_B = _MLP_BWD_DW_PROJ_BLOCK_M
     dW_proj = torch.empty((K_out, N_fc), dtype=proj_weight.dtype, device=z.device)
     grid_b = (triton.cdiv(K_out, BLOCK_K_OUT_B), triton.cdiv(N_fc, BLOCK_N_B))
-    wrap_triton(_mlp_dW_proj_bwd_kernel)[grid_b](
+    wrap_triton(_fused_mlp_dproj_weight_bwd_kernel)[grid_b](
         dy,
         z,
         dW_proj,
@@ -712,17 +763,19 @@ def _fused_mlp_block_bwd_impl(
         BLOCK_N=BLOCK_N_B,
         BLOCK_M=BLOCK_M_B,
         IEEE_PRECISION=ieee,
-        num_warps=4,
-        num_stages=2,
+        num_warps=_MLP_BWD_DW_PROJ_NUM_WARPS,
+        num_stages=_MLP_BWD_DW_PROJ_NUM_STAGES,
     )
 
     # C: dW_fc = dz.T @ x_hat, x_hat reconstructed in registers from
     # (x, rms_inv) — no x_hat HBM materialization. Output dtype
     # = fc_weight.dtype (fp32 master typical).
-    BLOCK_M_C, BLOCK_N_C, BLOCK_K_C = 32, 128, 64
+    BLOCK_M_C = _MLP_BWD_DW_FC_BLOCK_M
+    BLOCK_N_C = _MLP_BWD_DW_FC_BLOCK_N
+    BLOCK_K_C = _MLP_BWD_DW_FC_BLOCK_K
     dW_fc = torch.empty((N_fc, K), dtype=fc_weight.dtype, device=x.device)
     grid_c = (triton.cdiv(N_fc, BLOCK_N_C), triton.cdiv(K, BLOCK_K_C))
-    wrap_triton(_mlp_dW_fc_bwd_kernel)[grid_c](
+    wrap_triton(_fused_mlp_dfc_weight_bwd_kernel)[grid_c](
         dz,
         x,
         rms_inv,
@@ -734,8 +787,8 @@ def _fused_mlp_block_bwd_impl(
         BLOCK_N=BLOCK_N_C,
         BLOCK_K=BLOCK_K_C,
         IEEE_PRECISION=ieee,
-        num_warps=4,
-        num_stages=2,
+        num_warps=_MLP_BWD_DW_FC_NUM_WARPS,
+        num_stages=_MLP_BWD_DW_FC_NUM_STAGES,
     )
 
     # D: dx_hat matmul + RMSNorm bwd + outer-residual fold in one kernel.
@@ -743,15 +796,21 @@ def _fused_mlp_block_bwd_impl(
     # that config would exceed 100 KB SM shared-mem budget
     # ((64·128+128·64)·4 = 64 KB/stage × 2 = 128 KB), so use a safer
     # config for parity tests.
-    BLOCK_M_D = 128
+    BLOCK_M_D = _MLP_BWD_DX_BLOCK_M
     if ieee:
-        BLOCK_K_D, BLOCK_N_D, NW_D, ST_D = 64, 64, 8, 3  # fp32-safe
+        BLOCK_K_D = _MLP_BWD_DX_FP32_BLOCK_K
+        BLOCK_N_D = _MLP_BWD_DX_FP32_BLOCK_N
+        NW_D = _MLP_BWD_DX_FP32_NUM_WARPS
+        ST_D = _MLP_BWD_DX_FP32_NUM_STAGES
     else:
-        BLOCK_K_D, BLOCK_N_D, NW_D, ST_D = 64, 64, 4, 2  # bf16 winner
+        BLOCK_K_D = _MLP_BWD_DX_BF16_BLOCK_K
+        BLOCK_N_D = _MLP_BWD_DX_BF16_BLOCK_N
+        NW_D = _MLP_BWD_DX_BF16_NUM_WARPS
+        ST_D = _MLP_BWD_DX_BF16_NUM_STAGES
     num_m_tiles = triton.cdiv(M, BLOCK_M_D)
     dx = torch.empty_like(x)
     grid_d = (num_m_tiles, triton.cdiv(K, BLOCK_K_D))
-    wrap_triton(_mlp_dx_bwd_kernel)[grid_d](
+    wrap_triton(_fused_mlp_dx_bwd_kernel)[grid_d](
         dz,
         fc_weight,
         x,
@@ -779,10 +838,10 @@ def _fused_mlp_block_bwd_impl(
 
 
 @torch.library.triton_op(
-    "nanoops::fused_mlp_block_fwd",
+    "nanoops::fused_mlp_fwd",
     mutates_args=(),
 )
-def _fused_mlp_block_fwd_op(
+def _fused_mlp_fwd_op(
     x: torch.Tensor,
     fc_weight: torch.Tensor,
     proj_weight: torch.Tensor,
@@ -790,18 +849,18 @@ def _fused_mlp_block_fwd_op(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Triton-op forward wrapper.
 
-    Shapes mirror `_fused_mlp_block_fwd_impl`:
+    Shapes mirror `_fused_mlp_fwd_impl`:
       x (M, K), fc_weight (N_fc, K),
       proj_weight (K, N_fc) -> (y (M, K), rms_inv (M,), z (M, N_fc)).
     """
-    return _fused_mlp_block_fwd_impl(x, fc_weight, proj_weight, eps)
+    return _fused_mlp_fwd_impl(x, fc_weight, proj_weight, eps)
 
 
 @torch.library.triton_op(
-    "nanoops::fused_mlp_block_bwd",
+    "nanoops::fused_mlp_bwd",
     mutates_args=(),
 )
-def _fused_mlp_block_bwd_op(
+def _fused_mlp_bwd_op(
     dy: torch.Tensor,
     x: torch.Tensor,
     fc_weight: torch.Tensor,
@@ -818,10 +877,10 @@ def _fused_mlp_block_bwd_op(
     Returns:
       dx (M, K), dW_fc (N_fc, K), dW_proj (K, N_fc).
     """
-    return _fused_mlp_block_bwd_impl(dy, x, fc_weight, proj_weight, rms_inv, z)
+    return _fused_mlp_bwd_impl(dy, x, fc_weight, proj_weight, rms_inv, z)
 
 
-def _fused_mlp_block_setup_context(
+def _fused_mlp_setup_context(
     ctx: Any,
     inputs: tuple[torch.Tensor, torch.Tensor, torch.Tensor, float],
     output: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
@@ -837,13 +896,13 @@ def _fused_mlp_block_setup_context(
     ctx.save_for_backward(fc_weight, proj_weight, x, rms_inv, z)
 
 
-def _fused_mlp_block_autograd_backward(
+def _fused_mlp_autograd_backward(
     ctx: Any,
     grad_y: torch.Tensor,
     grad_rms_inv: torch.Tensor,
     grad_z: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, None]:
-    """Autograd callback for `nanoops::fused_mlp_block_fwd`.
+    """Autograd callback for `nanoops::fused_mlp_fwd`.
 
     Receives gradients for the three forward outputs:
       grad_y (M, K), grad_rms_inv (M,), grad_z (M, N_fc).
@@ -856,19 +915,19 @@ def _fused_mlp_block_autograd_backward(
     # grad_rms_inv / grad_z are zeros: rms_inv and z exist only to
     # plumb fwd→bwd state inside this op, no downstream consumer.
     W_fc, W_proj, x, rms_inv, z = ctx.saved_tensors
-    dx, dW_fc, dW_proj = _fused_mlp_block_bwd_op(
+    dx, dW_fc, dW_proj = _fused_mlp_bwd_op(
         grad_y, x, W_fc, W_proj, rms_inv, z
     )
     return dx, dW_fc, dW_proj, None
 
 
-_fused_mlp_block_fwd_op.register_autograd(
-    _fused_mlp_block_autograd_backward,
-    setup_context=_fused_mlp_block_setup_context,
+_fused_mlp_fwd_op.register_autograd(
+    _fused_mlp_autograd_backward,
+    setup_context=_fused_mlp_setup_context,
 )
 
 
-def fused_mlp_block(
+def fused_mlp(
     x: torch.Tensor,
     fc_weight: torch.Tensor,
     proj_weight: torch.Tensor,
@@ -909,7 +968,7 @@ def fused_mlp_block(
     # triton_op returns internal-M-view (y, rms_inv, z); rms_inv/z are
     # saved-for-backward only, so we drop them here and return just y in the
     # public `(B, T, K)` view.
-    y, _rms_inv, _z = _fused_mlp_block_fwd_op(
+    y, _rms_inv, _z = _fused_mlp_fwd_op(
         x_2d, fc_weight, proj_weight, eps
     )
     return y.view(B, T, K)

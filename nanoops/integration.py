@@ -122,7 +122,7 @@ def _mlp_inner(self, x):
 
 
 def _patched_block_forward(self, x, ve, cos_sin, window_size, kv_cache):
-    """Block.forward with the mlp side replaced by `fused_mlp_block`.
+    """Block.forward with the mlp side replaced by `fused_mlp`.
 
     Original (nanchat.gpt.Block.forward):
         x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
@@ -153,8 +153,8 @@ def _patched_block_forward(self, x, ve, cos_sin, window_size, kv_cache):
     # if attn produced a non-contiguous view (e.g. via stride tricks) the
     # fused kernel needs contiguous input for its index arithmetic.
     # Weight dtype cast (fp32 master → bf16 activation) is handled inside
-    # `fused_mlp_block` itself, so we pass the raw module weights here.
-    return _fused_mlp_block(
+    # `fused_mlp` itself, so we pass the raw module weights here.
+    return _fused_mlp(
         x.contiguous(),
         self.mlp.c_fc.weight,
         self.mlp.c_proj.weight,
@@ -165,7 +165,7 @@ def _patched_block_forward(self, x, ve, cos_sin, window_size, kv_cache):
 # original `norm` function (since the F-namespace patch may have routed
 # `nanchat.gpt.F` through nanoops).
 _orig_norm = None
-_fused_mlp_block = None
+_fused_mlp = None
 _fused_attn_qkv = None
 _fused_attn_output_proj = None
 
@@ -241,9 +241,9 @@ def _attn_qkv_residual(
     window = window_size[0]
     sdpa_window = T if (window < 0 or window >= T) else window + 1
     if _use_flash_sdpa_for_window(sdpa_window, T):
-        from .triton_fused_attn_sdpa import flash_sdpa as _triton_flash_sdpa
+        from .triton_fused_attn_sdpa import attn_sdpa as _triton_attn_sdpa
 
-        y = _triton_flash_sdpa(q, k, v, sdpa_window)
+        y = _triton_attn_sdpa(q, k, v, sdpa_window)
     else:
         y = nF.sliding_window_sdpa(
             q.transpose(1, 2),
@@ -279,9 +279,9 @@ def _training_flash_sdpa_bhmd(
     """
     if not (q.is_cuda and k.is_cuda and v.is_cuda):
         raise RuntimeError("Triton flash_sdpa training path requires CUDA tensors")
-    from .triton_fused_attn_sdpa import flash_sdpa as _triton_flash_sdpa
+    from .triton_fused_attn_sdpa import attn_sdpa as _triton_attn_sdpa
 
-    out = _triton_flash_sdpa(
+    out = _triton_attn_sdpa(
         q.transpose(1, 2).contiguous(),
         k.transpose(1, 2).contiguous(),
         v.transpose(1, 2).contiguous(),
@@ -291,10 +291,10 @@ def _training_flash_sdpa_bhmd(
 
 
 def _mlp_residual(self, x):
-    if _fused_mlp_block is None:
+    if _fused_mlp is None:
         return x + self.mlp(_rms_norm_no_weight(x))
 
-    return _fused_mlp_block(
+    return _fused_mlp(
         x.contiguous(),
         self.mlp.c_fc.weight,
         self.mlp.c_proj.weight,
@@ -546,7 +546,7 @@ def _apply() -> dict[str, dict]:
     instead of the true originals.
     """
     global _PATCHED, _orig_attn_forward, _orig_gpt_forward, _orig_norm
-    global _fused_mlp_block, _fused_attn_qkv, _fused_attn_output_proj
+    global _fused_mlp, _fused_attn_qkv, _fused_attn_output_proj
     if _PATCHED:
         raise RuntimeError(
             "nanoops.integration already patched; call _restore() before _apply() again"
@@ -573,19 +573,19 @@ def _apply() -> dict[str, dict]:
     gpt_mod = importlib.import_module("nanochat.gpt")
     originals["method"][("nanochat.gpt", "MLP", "forward")] = gpt_mod.MLP.forward
     gpt_mod.MLP.forward = _patched_mlp_forward
-    # Block.forward: opt-in via NANOOPS_FUSED_MLP_BLOCK=1. Replaces the
+    # Block.forward: opt-in via NANOOPS_FUSED_MLP=1. Replaces the
     # mlp half of Block.forward — `x + mlp(norm(x))` — with a single
-    # `fused_mlp_block(x, W_fc, W_proj)` call that collapses
+    # `fused_mlp(x, W_fc, W_proj)` call that collapses
     # norm + c_fc + relu² + c_proj + outer residual into 3 fwd Triton
     # kernels + 4 bwd Triton kernels.
     # See nanoops/TRITON_zh.md §3 for the fusion breakdown. Supersedes
     # the relu_square fusion (which is a subset of what's fused here).
-    if os.environ.get("NANOOPS_FUSED_MLP_BLOCK"):
-        from .triton_fused_mlp_block import fused_mlp_block as _fmb
+    if os.environ.get("NANOOPS_FUSED_MLP"):
+        from .triton_fused_mlp import fused_mlp as _fmb
 
         assert _orig_norm is None, "_orig_norm already captured — call _restore() first"
         _orig_norm = gpt_mod.norm
-        _fused_mlp_block = _fmb
+        _fused_mlp = _fmb
         originals["method"][("nanochat.gpt", "Block", "forward")] = (
             gpt_mod.Block.forward
         )
@@ -671,12 +671,12 @@ def _restore(originals: dict[str, dict]) -> None:
         cls = getattr(importlib.import_module(modname), cls_name)
         setattr(cls, method_name, original)
     global _PATCHED, _orig_attn_forward, _orig_gpt_forward, _orig_norm
-    global _fused_mlp_block, _fused_attn_qkv, _fused_attn_output_proj
+    global _fused_mlp, _fused_attn_qkv, _fused_attn_output_proj
     _PATCHED = False
     _orig_attn_forward = None
     _orig_gpt_forward = None
     _orig_norm = None
-    _fused_mlp_block = None
+    _fused_mlp = None
     _fused_attn_qkv = None
     _fused_attn_output_proj = None
 
@@ -701,8 +701,8 @@ def patch_nanchat() -> list[str]:
         names.append("MuonAdamW/DistMuonAdamW(CPU optim state offload)")
     if os.environ.get("NANOOPS_L_ATTN_CHECKPOINT"):
         names.append("CausalSelfAttention.forward(L-only activation checkpoint)")
-    if os.environ.get("NANOOPS_FUSED_MLP_BLOCK"):
-        names.append("Block.forward(fused_mlp_block — supersedes relu_square fusion)")
+    if os.environ.get("NANOOPS_FUSED_MLP"):
+        names.append("Block.forward(fused_mlp — supersedes relu_square fusion)")
     if os.environ.get("NANOOPS_FUSED_ATTN_QKV"):
         names.append("GPT.forward(norm_qkv_projection + attn_output_proj_residual fused)")
     return names
