@@ -1,7 +1,7 @@
-"""Attention output and small fused Triton kernels for nanoops.
+"""Attention output Triton kernels for nanoops.
 
-Contains `output_proj_residual` (c_proj + residual) and `value_gate`.
-Re-exported through `nanoops.triton_kernels`.
+Contains `output_proj_residual` (c_proj + residual), re-exported through
+`nanoops.triton_kernels`.
 """
 
 from __future__ import annotations
@@ -9,6 +9,7 @@ from __future__ import annotations
 from typing import Any
 
 import torch
+from torch.library import wrap_triton
 
 try:
     import triton
@@ -31,109 +32,14 @@ except ImportError:
 if _HAS_TRITON:
 
     @triton.jit
-    def _value_gate_kernel(
-        v_ptr,  # (M, D_v) — in: base value
-        ve_ptr,  # (M, D_v) — in: value embedding to gate in
-        x_ptr,  # (M, ve_gate_ch) — in: contiguous gate input slice
-        gate_w_ptr,  # (D_v, ve_gate_ch) — in: gate projection weight
-        out_ptr,  # (M, D_v) — out: v + gate * ve
-        M,  # int — row count after flattening leading dims
-        D_x,  # int — original x width, kept for call-site shape context
-        D_v,  # int — value width
-        ve_gate_ch,  # int — number of x columns used by the gate
-        stride_vm,  # int — v stride along M
-        stride_vd,  # int — v stride along D_v
-        stride_vem,  # int — ve stride along M
-        stride_ved,  # int — ve stride along D_v
-        stride_xm,  # int — x gate slice stride along M
-        stride_xd,  # int — x gate slice stride along gate channel
-        stride_gw_d_out,  # int — gate_w stride along D_v
-        stride_gw_d_in,  # int — gate_w stride along gate channel
-        stride_om,  # int — out stride along M
-        stride_od,  # int — out stride along D_v
-        BLOCK_M: tl.constexpr,
-        BLOCK_D: tl.constexpr,
-        BLOCK_K: tl.constexpr,
-    ):
-        """Fused value-residual gate (ResFormer):
-            gate = 3 * sigmoid(x[..., :ch] @ gate_w.T)       # (M, D_v_head_dim)
-            out  = v + gate * ve
-        Where ch = ve_gate_channels (small).
-
-        Per row m, gate is per-head (we broadcast across head_dim
-        elements). For simplicity here we expand gate to v's shape via
-        the same broadcasting the eager code does.
-        """
-        pid_m = tl.program_id(0)
-        pid_d = tl.program_id(1)
-        rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-        cols = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
-        row_mask = rows < M
-        col_mask = cols < D_v
-
-        # Compute gate = 3 * sigmoid(x[:, :ch] @ gate_w.T) for the rows in this tile.
-        # gate_w shape: (D_v, ve_gate_ch). x slice: (BLOCK_M, ve_gate_ch).
-        # Result gate: (BLOCK_M, D_v) — broadcast across cols later if needed.
-        # We compute the per-row, per-output-dim gate value once and reuse for
-        # the cols of v in this tile.
-        gate_acc = tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32)
-        for k_start in range(0, ve_gate_ch, BLOCK_K):
-            ks = k_start + tl.arange(0, BLOCK_K)
-            k_mask = ks < ve_gate_ch
-            x_ptrs = x_ptr + rows[:, None] * stride_xm + ks[None, :] * stride_xd
-            x_chunk = tl.load(
-                x_ptrs,
-                mask=row_mask[:, None] & k_mask[None, :],
-                other=0.0,
-            ).to(tl.float32)
-            gw_ptrs = (
-                gate_w_ptr
-                + cols[:, None] * stride_gw_d_out
-                + ks[None, :] * stride_gw_d_in
-            )
-            gw = tl.load(
-                gw_ptrs,
-                mask=col_mask[:, None] & k_mask[None, :],
-                other=0.0,
-            ).to(tl.float32)
-            gate_acc += tl.dot(x_chunk, tl.trans(gw), input_precision="ieee")
-        gate = 3.0 * tl.sigmoid(gate_acc)
-
-        # Load v, ve, compute out = v + gate * ve
-        v_ptrs = v_ptr + rows[:, None] * stride_vm + cols[None, :] * stride_vd
-        ve_ptrs = ve_ptr + rows[:, None] * stride_vem + cols[None, :] * stride_ved
-        v = tl.load(v_ptrs, mask=row_mask[:, None] & col_mask[None, :], other=0.0).to(
-            tl.float32
-        )
-        ve = tl.load(ve_ptrs, mask=row_mask[:, None] & col_mask[None, :], other=0.0).to(
-            tl.float32
-        )
-        out = v + gate * ve
-
-        o_ptrs = out_ptr + rows[:, None] * stride_om + cols[None, :] * stride_od
-        tl.store(
-            o_ptrs,
-            out.to(out_ptr.dtype.element_ty),
-            mask=row_mask[:, None] & col_mask[None, :],
-        )
-
-    @triton.jit
     def _output_proj_residual_kernel(
         attn_out_ptr,  # (M, D_in) — in: attention output
         proj_w_ptr,  # (D_out, D_in) — in: output projection weight
         residual_ptr,  # (M, D_out) — in: residual stream
         y_ptr,  # (M, D_out) — out: residual + attn_out @ W.T
         M,  # int — row count after flattening leading dims
-        D_out,  # int — projection output width
-        D_in,  # int — projection input width
-        stride_am,  # int — attn_out stride along M
-        stride_ad,  # int — attn_out stride along D_in
-        stride_pw_dout,  # int — proj_weight stride along D_out
-        stride_pw_din,  # int — proj_weight stride along D_in
-        stride_rm,  # int — residual stride along M
-        stride_rd,  # int — residual stride along D_out
-        stride_ym,  # int — y stride along M
-        stride_yd,  # int — y stride along D_out
+        D_OUT: tl.constexpr,  # projection output width
+        D_IN: tl.constexpr,  # projection input width
         BLOCK_M: tl.constexpr,
         BLOCK_DOUT: tl.constexpr,
         BLOCK_DIN: tl.constexpr,
@@ -149,118 +55,281 @@ if _HAS_TRITON:
         rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
         cols = pid_d * BLOCK_DOUT + tl.arange(0, BLOCK_DOUT)
         row_mask = rows < M
-        col_mask = cols < D_out
+        col_mask = cols < D_OUT
         out_mask = row_mask[:, None] & col_mask[None, :]
 
         # Matmul-accumulate
         acc = tl.zeros((BLOCK_M, BLOCK_DOUT), dtype=tl.float32)
-        for k_start in range(0, D_in, BLOCK_DIN):
+        for k_start in range(0, D_IN, BLOCK_DIN):
             ks = k_start + tl.arange(0, BLOCK_DIN)
-            k_mask = ks < D_in
-            a_ptrs = attn_out_ptr + rows[:, None] * stride_am + ks[None, :] * stride_ad
+            k_mask = ks < D_IN
+            a_ptrs = attn_out_ptr + rows[:, None] * D_IN + ks[None, :]
             a = tl.load(
                 a_ptrs,
                 mask=row_mask[:, None] & k_mask[None, :],
                 other=0.0,
-            ).to(tl.float32)
-            pw_ptrs = (
-                proj_w_ptr
-                + cols[:, None] * stride_pw_dout
-                + ks[None, :] * stride_pw_din
             )
+            pw_ptrs = proj_w_ptr + cols[:, None] * D_IN + ks[None, :]
             pw = tl.load(
                 pw_ptrs,
                 mask=col_mask[:, None] & k_mask[None, :],
                 other=0.0,
-            ).to(tl.float32)
-            acc += tl.dot(a, tl.trans(pw), input_precision="ieee")
+            ).to(a.dtype)
+            acc += tl.dot(a, tl.trans(pw))
 
         # Add residual at the end in native dtype (saves a bf16→fp32
         # conversion on residual load + skips the final store cast).
-        res_ptrs = residual_ptr + rows[:, None] * stride_rm + cols[None, :] * stride_rd
+        res_ptrs = residual_ptr + rows[:, None] * D_OUT + cols[None, :]
         residual = tl.load(res_ptrs, mask=out_mask, other=0.0)
         y = acc.to(y_ptr.dtype.element_ty) + residual
 
-        y_ptrs = y_ptr + rows[:, None] * stride_ym + cols[None, :] * stride_yd
+        y_ptrs = y_ptr + rows[:, None] * D_OUT + cols[None, :]
         tl.store(y_ptrs, y, mask=out_mask)
 
+    @triton.jit
+    def _output_proj_residual_dattn_bwd_kernel(
+        proj_w_ptr,  # (D_out, D_in) — in: projection weight
+        dy_ptr,  # (M, D_out) — in: output gradient
+        d_attn_out_ptr,  # (M, D_in) — out: dy @ proj_weight
+        M,  # int — row count after flattening leading dims
+        D_OUT: tl.constexpr,  # projection output width
+        D_IN: tl.constexpr,  # projection input width
+        BLOCK_M: tl.constexpr,
+        BLOCK_DOUT: tl.constexpr,
+        BLOCK_DIN: tl.constexpr,
+    ):
+        """Compute d_attn_out = dy @ proj_weight."""
+        pid_m = tl.program_id(0)
+        pid_din = tl.program_id(1)
+        rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        din_cols = pid_din * BLOCK_DIN + tl.arange(0, BLOCK_DIN)
+        row_mask = rows < M
+        din_mask = din_cols < D_IN
 
-class OutputProjResidual(torch.autograd.Function):
-    """y = residual + attn_out @ proj_weight.T
+        d_attn_acc = tl.zeros((BLOCK_M, BLOCK_DIN), dtype=tl.float32)
 
-    Forward: one Triton kernel — matmul with residual loaded as the
-    accumulator init (same pattern as cuBLAS addmm). Backward uses
-    cuBLAS for the two matmul gradients; residual gradient is identity.
-    """
+        for dout_start in range(0, D_OUT, BLOCK_DOUT):
+            dout_cols = dout_start + tl.arange(0, BLOCK_DOUT)
+            dout_mask = dout_cols < D_OUT
 
-    @staticmethod
-    def forward(
-        ctx: Any,
-        attn_out: torch.Tensor,
-        proj_weight: torch.Tensor,
-        residual: torch.Tensor,
-    ) -> torch.Tensor:
-        """Run output projection and residual add.
+            dy_ptrs = dy_ptr + rows[:, None] * D_OUT + dout_cols[None, :]
+            dy = tl.load(
+                dy_ptrs,
+                mask=row_mask[:, None] & dout_mask[None, :],
+                other=0.0,
+            )
+            w_ptrs = proj_w_ptr + dout_cols[:, None] * D_IN + din_cols[None, :]
+            w = tl.load(
+                w_ptrs,
+                mask=dout_mask[:, None] & din_mask[None, :],
+                other=0.0,
+            ).to(dy.dtype)
 
-        Args:
-          attn_out: (M, D_in) CUDA tensor.
-          proj_weight: (D_out, D_in) projection weight.
-          residual: (M, D_out) residual stream tensor.
+            d_attn_acc += tl.dot(dy, w)
 
-        Returns:
-          (M, D_out) projected residual output."""
-        assert attn_out.is_cuda and proj_weight.is_cuda and residual.is_cuda
-        M, D_in = attn_out.shape
-        D_out, D_in_w = proj_weight.shape
-        assert D_in == D_in_w
-        y = torch.empty((M, D_out), dtype=attn_out.dtype, device=attn_out.device)
-        BLOCK_M, BLOCK_DOUT, BLOCK_DIN = 32, 64, 32
-        grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(D_out, BLOCK_DOUT))
-        _output_proj_residual_kernel[grid](
-            attn_out,
-            proj_weight,
-            residual,
-            y,
-            M,
-            D_out,
-            D_in,
-            attn_out.stride(0),
-            attn_out.stride(1),
-            proj_weight.stride(0),
-            proj_weight.stride(1),
-            residual.stride(0),
-            residual.stride(1),
-            y.stride(0),
-            y.stride(1),
-            BLOCK_M=BLOCK_M,
-            BLOCK_DOUT=BLOCK_DOUT,
-            BLOCK_DIN=BLOCK_DIN,
+        d_attn_ptrs = d_attn_out_ptr + rows[:, None] * D_IN + din_cols[None, :]
+        tl.store(
+            d_attn_ptrs,
+            d_attn_acc.to(d_attn_out_ptr.dtype.element_ty),
+            mask=row_mask[:, None] & din_mask[None, :],
         )
-        ctx.save_for_backward(attn_out, proj_weight)
-        return y
 
-    @staticmethod
-    def backward(
-        ctx: Any,
-        dy: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Backprop for y = residual + attn_out @ proj_weight.T.
+    @triton.jit
+    def _output_proj_residual_dweight_bwd_kernel(
+        attn_out_ptr,  # (M, D_in) — in: forward attention output
+        dy_ptr,  # (M, D_out) — in: output gradient
+        d_proj_w_ptr,  # (D_out, D_in) — out: dy.T @ attn_out
+        M,  # int — row count after flattening leading dims
+        D_OUT: tl.constexpr,  # projection output width
+        D_IN: tl.constexpr,  # projection input width
+        BLOCK_M: tl.constexpr,
+        BLOCK_DOUT: tl.constexpr,
+        BLOCK_DIN: tl.constexpr,
+    ):
+        """Compute d_proj_weight = dy.T @ attn_out without atomics."""
+        pid_dout = tl.program_id(0)
+        pid_din = tl.program_id(1)
+        dout_cols = pid_dout * BLOCK_DOUT + tl.arange(0, BLOCK_DOUT)
+        din_cols = pid_din * BLOCK_DIN + tl.arange(0, BLOCK_DIN)
+        dout_mask = dout_cols < D_OUT
+        din_mask = din_cols < D_IN
 
-        Args:
-          dy: (M, D_out) gradient of output.
+        d_w_acc = tl.zeros((BLOCK_DOUT, BLOCK_DIN), dtype=tl.float32)
+        for m_start in range(0, M, BLOCK_M):
+            rows = m_start + tl.arange(0, BLOCK_M)
+            row_mask = rows < M
+            dy = tl.load(
+                dy_ptr + rows[:, None] * D_OUT + dout_cols[None, :],
+                mask=row_mask[:, None] & dout_mask[None, :],
+                other=0.0,
+            )
+            attn = tl.load(
+                attn_out_ptr + rows[:, None] * D_IN + din_cols[None, :],
+                mask=row_mask[:, None] & din_mask[None, :],
+                other=0.0,
+            ).to(dy.dtype)
+            d_w_acc += tl.dot(tl.trans(dy), attn)
 
-        Returns:
-          Gradients for (attn_out, proj_weight, residual)."""
-        attn_out, proj_weight = ctx.saved_tensors
-        dy = dy.contiguous()
-        # y = residual + attn_out @ proj_weight.T
-        # d_residual = dy (identity)
-        # d_attn_out = dy @ proj_weight
-        # d_proj_weight = dy.T @ attn_out
-        d_attn_out = dy @ proj_weight
-        d_proj_weight = dy.t() @ attn_out
-        d_residual = dy
-        return d_attn_out, d_proj_weight, d_residual
+        tl.store(
+            d_proj_w_ptr + dout_cols[:, None] * D_IN + din_cols[None, :],
+            d_w_acc.to(d_proj_w_ptr.dtype.element_ty),
+            mask=dout_mask[:, None] & din_mask[None, :],
+        )
+
+
+def _output_proj_residual_fwd_impl(
+    attn_out: torch.Tensor,
+    proj_weight: torch.Tensor,
+    residual: torch.Tensor,
+) -> torch.Tensor:
+    """Run `y = residual + attn_out @ proj_weight.T`.
+
+    Args:
+      attn_out: (M, D_in) contiguous CUDA tensor.
+      proj_weight: (D_out, D_in) contiguous projection weight.
+      residual: (M, D_out) contiguous residual stream tensor.
+
+    Returns:
+      (M, D_out) projected residual output.
+    """
+    if not _HAS_TRITON:
+        raise RuntimeError("output_proj_residual requires triton")
+    assert attn_out.is_cuda and proj_weight.is_cuda and residual.is_cuda
+    assert attn_out.is_contiguous() and proj_weight.is_contiguous() and residual.is_contiguous()
+    assert attn_out.ndim == proj_weight.ndim == residual.ndim == 2
+    M, D_in = attn_out.shape
+    M_res, D_out = residual.shape
+    D_out_w, D_in_w = proj_weight.shape
+    assert M == M_res and D_in == D_in_w and D_out == D_out_w
+
+    y = torch.empty((M, D_out), dtype=attn_out.dtype, device=attn_out.device)
+    BLOCK_M, BLOCK_DOUT, BLOCK_DIN = 32, 64, 32
+    grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(D_out, BLOCK_DOUT))
+    wrap_triton(_output_proj_residual_kernel)[grid](
+        attn_out,
+        proj_weight,
+        residual,
+        y,
+        M,
+        D_out,
+        D_in,
+        BLOCK_M=BLOCK_M,
+        BLOCK_DOUT=BLOCK_DOUT,
+        BLOCK_DIN=BLOCK_DIN,
+    )
+    return y
+
+
+def _output_proj_residual_bwd_impl(
+    dy: torch.Tensor,
+    attn_out: torch.Tensor,
+    proj_weight: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute gradients for `y = residual + attn_out @ proj_weight.T`.
+
+    Args:
+      dy: (M, D_out) gradient of output.
+      attn_out: (M, D_in) saved forward attention output.
+      proj_weight: (D_out, D_in) saved projection weight.
+
+    Returns:
+      d_attn_out: (M, D_in), `dy @ proj_weight`.
+      d_proj_weight: (D_out, D_in), `dy.T @ attn_out`.
+    """
+    if not _HAS_TRITON:
+        raise RuntimeError("output_proj_residual backward requires triton")
+    dy = dy.contiguous()
+    assert dy.is_cuda and attn_out.is_cuda and proj_weight.is_cuda
+    assert dy.is_contiguous() and attn_out.is_contiguous() and proj_weight.is_contiguous()
+    M, D_in = attn_out.shape
+    M_dy, D_out = dy.shape
+    D_out_w, D_in_w = proj_weight.shape
+    assert M == M_dy and D_in == D_in_w and D_out == D_out_w
+
+    d_attn_out = torch.empty_like(attn_out)
+    d_proj_weight = torch.empty_like(proj_weight)
+    BLOCK_M, BLOCK_DOUT, BLOCK_DIN = 32, 64, 32
+    dattn_grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(D_in, BLOCK_DIN))
+    wrap_triton(_output_proj_residual_dattn_bwd_kernel)[dattn_grid](
+        proj_weight,
+        dy,
+        d_attn_out,
+        M,
+        D_out,
+        D_in,
+        BLOCK_M=BLOCK_M,
+        BLOCK_DOUT=BLOCK_DOUT,
+        BLOCK_DIN=BLOCK_DIN,
+    )
+    dweight_grid = (triton.cdiv(D_out, BLOCK_DOUT), triton.cdiv(D_in, BLOCK_DIN))
+    wrap_triton(_output_proj_residual_dweight_bwd_kernel)[dweight_grid](
+        attn_out,
+        dy,
+        d_proj_weight,
+        M,
+        D_out,
+        D_in,
+        BLOCK_M=BLOCK_M,
+        BLOCK_DOUT=BLOCK_DOUT,
+        BLOCK_DIN=BLOCK_DIN,
+    )
+    return d_attn_out, d_proj_weight
+
+
+@torch.library.triton_op(
+    "nanoops::output_proj_residual_fwd",
+    mutates_args=(),
+)
+def _output_proj_residual_fwd_op(
+    attn_out: torch.Tensor,
+    proj_weight: torch.Tensor,
+    residual: torch.Tensor,
+) -> torch.Tensor:
+    """Triton-op forward wrapper for output projection + residual add."""
+    return _output_proj_residual_fwd_impl(attn_out, proj_weight, residual)
+
+
+@torch.library.triton_op(
+    "nanoops::output_proj_residual_bwd",
+    mutates_args=(),
+)
+def _output_proj_residual_bwd_op(
+    dy: torch.Tensor,
+    attn_out: torch.Tensor,
+    proj_weight: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Triton-op backward wrapper returning `(d_attn_out, d_proj_weight)`."""
+    return _output_proj_residual_bwd_impl(dy, attn_out, proj_weight)
+
+
+def _output_proj_residual_setup_context(
+    ctx: Any,
+    inputs: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    output: torch.Tensor,
+) -> None:
+    """Save tensors for output projection backward."""
+    attn_out, proj_weight, _residual = inputs
+    ctx.save_for_backward(attn_out, proj_weight)
+
+
+def _output_proj_residual_autograd_backward(
+    ctx: Any,
+    grad_y: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Autograd callback for `nanoops::output_proj_residual_fwd`."""
+    attn_out, proj_weight = ctx.saved_tensors
+    d_attn_out, d_proj_weight = _output_proj_residual_bwd_op(
+        grad_y,
+        attn_out,
+        proj_weight,
+    )
+    return d_attn_out, d_proj_weight, grad_y
+
+
+_output_proj_residual_fwd_op.register_autograd(
+    _output_proj_residual_autograd_backward,
+    setup_context=_output_proj_residual_setup_context,
+)
 
 
 def output_proj_residual(
@@ -278,125 +347,8 @@ def output_proj_residual(
     Returns:
       (M, D_out) projected residual output.
     """
-    return OutputProjResidual.apply(attn_out, proj_weight, residual)
-
-
-# ─────────────────────────────────────────────────────────────────────
-# ValueGate autograd.Function: out = v + 3·sigmoid(x[:, :ch] @ gate_w.T) · ve
-# Forward: _value_gate_kernel.
-# Backward: cuBLAS for matmul-grads; small Triton-able elementwise but
-# we just use torch ops for simplicity (it's only 3-4 elementwise ops).
-# ─────────────────────────────────────────────────────────────────────
-
-
-class ValueGate(torch.autograd.Function):
-    @staticmethod
-    def forward(
-        ctx: Any,
-        v: torch.Tensor,
-        ve: torch.Tensor,
-        x: torch.Tensor,
-        gate_w: torch.Tensor,
-    ) -> torch.Tensor:
-        """Args:
-            v:      (M, D_v) — base value
-            ve:     (M, D_v) — value embedding to mix in
-            x:      (M, D_x) — gate input (only first ve_gate_ch cols used)
-            gate_w: (D_v, ve_gate_ch) — gate projection
-        Returns:
-            out: (M, D_v)
-        """
-        assert v.is_cuda and ve.is_cuda and x.is_cuda and gate_w.is_cuda
-        M, D_v = v.shape
-        ve_gate_ch = gate_w.shape[1]
-        x_in = x[:, :ve_gate_ch].contiguous()
-        out = torch.empty_like(v)
-
-        BLOCK_M, BLOCK_D, BLOCK_K = 32, 64, 32
-        grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(D_v, BLOCK_D))
-        _value_gate_kernel[grid](
-            v,
-            ve,
-            x_in,
-            gate_w,
-            out,
-            M,
-            x.shape[1],
-            D_v,
-            ve_gate_ch,
-            v.stride(0),
-            v.stride(1),
-            ve.stride(0),
-            ve.stride(1),
-            x_in.stride(0),
-            x_in.stride(1),
-            gate_w.stride(0),
-            gate_w.stride(1),
-            out.stride(0),
-            out.stride(1),
-            BLOCK_M=BLOCK_M,
-            BLOCK_D=BLOCK_D,
-            BLOCK_K=BLOCK_K,
-        )
-        ctx.save_for_backward(v, ve, x_in, gate_w)
-        ctx.ve_gate_ch = ve_gate_ch
-        ctx.x_full_shape = x.shape
-        return out
-
-    @staticmethod
-    def backward(
-        ctx: Any,
-        d_out: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Backprop for ValueGate.
-
-        Args:
-          d_out: (M, D_v) gradient of output.
-
-        Returns:
-          Gradients for (v, ve, x, gate_w)."""
-        v, ve, x_in, gate_w = ctx.saved_tensors
-        ve_gate_ch = ctx.ve_gate_ch
-        x_full_shape = ctx.x_full_shape
-
-        # Recompute gate = 3·sigmoid(x_in @ gate_w.T) in fp32.
-        # (Could save in fwd; recomputing is cheap and saves ctx memory.)
-        s = torch.sigmoid((x_in.float() @ gate_w.float().t()))  # (M, D_v)
-        gate = 3.0 * s
-
-        # out = v + gate * ve
-        # d_v = d_out
-        # d_gate = d_out * ve   → d_s = 3 * d_gate → d_logits = d_s * s*(1-s)
-        # d_ve = d_out * gate
-        d_v = d_out
-        d_ve = d_out * gate.to(d_out.dtype)
-        d_gate = d_out.float() * ve.float()
-        d_s = 3.0 * d_gate
-        d_logits = d_s * s * (1.0 - s)  # (M, D_v)
-        # logits = x_in @ gate_w.T → d_x_in = d_logits @ gate_w; d_gate_w = d_logits.T @ x_in
-        d_x_in = (d_logits @ gate_w.float()).to(x_in.dtype)
-        d_gate_w = (d_logits.t() @ x_in.float()).to(gate_w.dtype)
-        # Reconstruct d_x with zeros for the unused tail columns.
-        d_x = torch.zeros(x_full_shape, dtype=x_in.dtype, device=x_in.device)
-        d_x[:, :ve_gate_ch] = d_x_in
-        return d_v, d_ve, d_x, d_gate_w
-
-
-def value_gate(
-    v: torch.Tensor,
-    ve: torch.Tensor,
-    x: torch.Tensor,
-    gate_w: torch.Tensor,
-) -> torch.Tensor:
-    """Fused ResFormer value gate.
-
-    Args:
-      v: (M, D_v) base value tensor.
-      ve: (M, D_v) value embedding mixed by the gate.
-      x: (M, D_x) gate input; only the first `gate_w.shape[1]` columns are used.
-      gate_w: (D_v, ve_gate_ch) gate projection weight.
-
-    Returns:
-      (M, D_v) tensor `v + 3 * sigmoid(x[:, :ch] @ gate_w.T) * ve`.
-    """
-    return ValueGate.apply(v, ve, x, gate_w)
+    assert attn_out.ndim == proj_weight.ndim == residual.ndim == 2
+    attn_out = attn_out.contiguous()
+    proj_weight = proj_weight.contiguous()
+    residual = residual.contiguous()
+    return _output_proj_residual_fwd_op(attn_out, proj_weight, residual)

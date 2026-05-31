@@ -33,7 +33,7 @@ Patched ops:
     nanochat.gpt.CausalSelfAttention.forward
                                           — optional L-layer activation ckpt
     nanochat.flash_attention._sdpa_attention
-                                          — sliding_window_sdpa + chunked full-attn
+                                          — sliding_window_sdpa + optional flash_sdpa experiment
     nanochat.optim.DistMuonAdamW._compute_adamw / _compute_muon
                                           — CPU optim state offload (dual-GPU)
     nanochat.optim.MuonAdamW._step_adamw / _step_muon
@@ -169,6 +169,21 @@ _fused_mlp_block = None
 _fused_attn_qkv = None
 
 
+def _flash_sdpa_training_mode() -> str:
+    """Return experimental Triton SDPA training mode: '', 'sliding', or 'all'."""
+    mode = os.environ.get("NANOOPS_FLASH_SDPA_TRAINING", "").lower()
+    if mode in {"1", "true", "sliding"}:
+        return "sliding"
+    if mode == "all":
+        return "all"
+    return ""
+
+
+def _use_flash_sdpa_for_window(window_size: int, sequence_len: int) -> bool:
+    mode = _flash_sdpa_training_mode()
+    return mode == "all" or (mode == "sliding" and window_size < sequence_len)
+
+
 def _rms_norm_no_weight(x: torch.Tensor) -> torch.Tensor:
     return nF.rms_norm(x, (x.size(-1),))
 
@@ -220,13 +235,20 @@ def _attn_qkv_residual(
         1.2,
         1e-6,
     )
-    y = _flash_attn.flash_attn_func(
-        q,
-        k,
-        v,
-        causal=True,
-        window_size=window_size,
-    )
+    window = window_size[0]
+    sdpa_window = T if (window < 0 or window >= T) else window + 1
+    if _use_flash_sdpa_for_window(sdpa_window, T):
+        from .triton_kernels import flash_sdpa as _triton_flash_sdpa
+
+        y = _triton_flash_sdpa(q, k, v, sdpa_window)
+    else:
+        y = nF.sliding_window_sdpa(
+            q.transpose(1, 2),
+            k.transpose(1, 2),
+            v.transpose(1, 2),
+            window_size=sdpa_window,
+            chunk_size=max(1, T // 8) if sdpa_window >= T else None,
+        ).transpose(1, 2)
     y = y.contiguous().view(B, T, -1)
     y = attn.c_proj(y)
     return x_mix + y
@@ -235,6 +257,33 @@ def _attn_qkv_residual(
 def _attn_native_residual(self, x, ve, cos_sin, window_size):
     """Attention residual matching the non-QKV-fused Block.forward path."""
     return x + self.attn(_rms_norm_no_weight(x), ve, cos_sin, window_size, None)
+
+
+def _training_flash_sdpa_bhmd(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    window_size: int,
+) -> torch.Tensor:
+    """Run Triton SDPA for training inputs in `(B, H, M, D)` layout.
+
+    `nanochat.flash_attention.flash_attn_func` transposes its native
+    `(B, M, H, D)` tensors to PyTorch SDPA's `(B, H, M, D)` layout before
+    calling `_sdpa_attention`. The Triton kernel is intentionally kept in
+    `(B, M, H, D)`, so this helper translates the layout at the patch
+    boundary and returns `(B, H, M, D)` to preserve the original contract.
+    """
+    if not (q.is_cuda and k.is_cuda and v.is_cuda):
+        raise RuntimeError("Triton flash_sdpa training path requires CUDA tensors")
+    from .triton_kernels import flash_sdpa as _triton_flash_sdpa
+
+    out = _triton_flash_sdpa(
+        q.transpose(1, 2).contiguous(),
+        k.transpose(1, 2).contiguous(),
+        v.transpose(1, 2).contiguous(),
+        window_size,
+    )
+    return out.transpose(1, 2)
 
 
 def _mlp_residual(self, x):
@@ -387,11 +436,9 @@ def _patched_l_attn_forward(self, x, ve, cos_sin, window_size, kv_cache):
 def _patched_sdpa_attention(q, k, v, window_size, enable_gqa):
     """Replacement for nanchat.flash_attention._sdpa_attention.
 
-    Routes ALL training attention (both sliding-window S layers and full
-    L layers, whenever Tq == Tk) through nanoops's SlidingWindowSDPA so
-    they share one autograd-graph shape and one chunked-ctx memory model.
-    For L layers we set window_size=Tq (the sliding mask reduces to pure
-    causal) and chunk_size=Tq//8 so the GEMMs stay reasonably sized.
+    Default training path uses nanoops's chunked `SlidingWindowSDPA`.
+    Triton `flash_sdpa` can be enabled for controlled experiments with
+    `NANOOPS_FLASH_SDPA_TRAINING=sliding` or `NANOOPS_FLASH_SDPA_TRAINING=all`.
 
     Inference paths keep the original behavior:
       - single-token gen (Tq == 1): trim k/v + PyTorch SDPA
@@ -401,14 +448,11 @@ def _patched_sdpa_attention(q, k, v, window_size, enable_gqa):
     Tk = k.size(2)
     window = window_size[0]
 
-    # Full context, same length — route through nF.sliding_window_sdpa
-    # with window_size=Tq (covers all keys, so the sliding mask reduces
-    # to pure causal) and chunk_size=Tq//8. Note: this gives up Flash
-    # backend's tile-based O(L) memory; A/B on d24+B=1 didn't help with
-    # OOM, but we keep the unified chunked codepath so all training
-    # attention goes through the same nanoops Function (consistent
-    # autograd graph, easier to reason about).
+    # Full context, same length. Default to the chunked matmul path unless the
+    # Triton flash_sdpa training experiment is explicitly enabled.
     if (window < 0 or window >= Tq) and Tq == Tk:
+        if q.is_cuda and _use_flash_sdpa_for_window(Tq, Tq):
+            return _training_flash_sdpa_bhmd(q, k, v, Tq)
         return nF.sliding_window_sdpa(
             q,
             k,
@@ -428,7 +472,7 @@ def _patched_sdpa_attention(q, k, v, window_size, enable_gqa):
             q, k, v, is_causal=False, enable_gqa=enable_gqa
         )
 
-    # Sliding window during training (Tq == Tk, finite window) — chunked path.
+    # Sliding window during training (Tq == Tk, finite window).
     if Tq == Tk and window >= 0 and window < Tq:
         # Convention translation between nanchat and nanoops sliding window:
         #   nanchat: window = max distance back (FA3-style "left" arg, 0..window
@@ -436,6 +480,8 @@ def _patched_sdpa_attention(q, k, v, window_size, enable_gqa):
         #   nanoops: W      = TOTAL number of keys each query attends to
         # So nanoops_W = nanchat_window + 1. See nanchat/flash_attention.py:85
         # ("window is 'left' tokens we need to include (window + 1) keys total").
+        if q.is_cuda and _use_flash_sdpa_for_window(window + 1, Tq):
+            return _training_flash_sdpa_bhmd(q, k, v, window + 1)
         return nF.sliding_window_sdpa(q, k, v, window + 1, enable_gqa=enable_gqa)
 
     # Cached generation with chunk inference (Tq != Tk) — build explicit mask
@@ -567,12 +613,9 @@ def _apply() -> dict[str, dict]:
             _orig_attn_forward
         )
         gpt_mod.CausalSelfAttention.forward = _patched_l_attn_forward
-    # Sliding window SDPA: always ON (measured +6.2% tok/sec and -10.4%
-    # peak memory at B=2 on nanchat d20, RTX 3090). Patched
-    # _sdpa_attention falls through to the original SDPA call for full
-    # attention layers and single-token inference, so this swap is a
-    # strict superset of behavior — no regression possible on the
-    # non-sliding paths.
+    # Training SDPA patch: default is the chunked nanoops implementation.
+    # Triton flash_sdpa is kept behind an explicit A/B switch until the
+    # full-training path has been revalidated with the split backward.
     fa_mod = importlib.import_module("nanochat.flash_attention")
     originals["module_func"][("nanochat.flash_attention", "_sdpa_attention")] = (
         fa_mod._sdpa_attention
@@ -643,7 +686,10 @@ def patch_nanchat() -> list[str]:
     names.append("nanochat.flash_attention._sdpa_attention(sliding_window_sdpa)")
     if os.environ.get("NANOOPS_MLP_CHECKPOINT"):
         names.append("MLP.forward(activation checkpoint)")
-    names.append("_sdpa_attention(full-attn → chunked sliding, default)")
+    if _flash_sdpa_training_mode():
+        names.append(f"_sdpa_attention(Triton flash_sdpa {_flash_sdpa_training_mode()} experiment)")
+    else:
+        names.append("_sdpa_attention(full/sliding training → chunked sliding, default)")
     if os.environ.get("NANOOPS_OFFLOAD_OPTIM"):
         names.append("MuonAdamW/DistMuonAdamW(CPU optim state offload)")
     if os.environ.get("NANOOPS_L_ATTN_CHECKPOINT"):

@@ -16,7 +16,6 @@ from nanoops.triton_fused_attn_qkv import (
 from nanoops.triton_kernels import (
     norm_qkv_projection_with_residual_mix,
     output_proj_residual,
-    value_gate,
 )
 
 
@@ -662,22 +661,22 @@ def test_norm_qkv_projection_residual_mix_backward():
 def test_output_proj_residual_forward():
     torch.manual_seed(0)
     M, D_in, D_out = 32, 64, 48
-    attn_out = torch.randn(M, D_in, dtype=torch.float32, device="cuda")
-    proj_w = torch.randn(D_out, D_in, dtype=torch.float32, device="cuda") * 0.1
-    res = torch.randn(M, D_out, dtype=torch.float32, device="cuda")
+    attn_out = torch.randn(M, D_in, dtype=torch.bfloat16, device="cuda")
+    proj_w = (torch.randn(D_out, D_in, dtype=torch.bfloat16, device="cuda") * 0.1).to(torch.bfloat16)
+    res = torch.randn(M, D_out, dtype=torch.bfloat16, device="cuda")
     y_ref = torch.addmm(res, attn_out, proj_w.t())
     y_triton = output_proj_residual(attn_out, proj_w, res)
-    assert torch.allclose(y_ref, y_triton, atol=1e-3), \
+    assert torch.allclose(y_ref, y_triton, atol=2e-2), \
         f"fwd max diff {(y_ref - y_triton).abs().max():.4e}"
 
 
 def test_output_proj_residual_backward():
     torch.manual_seed(0)
     M, D_in, D_out = 32, 64, 48
-    a0 = torch.randn(M, D_in, dtype=torch.float32, device="cuda")
-    w0 = torch.randn(D_out, D_in, dtype=torch.float32, device="cuda") * 0.1
-    r0 = torch.randn(M, D_out, dtype=torch.float32, device="cuda")
-    g = torch.randn(M, D_out, dtype=torch.float32, device="cuda")
+    a0 = torch.randn(M, D_in, dtype=torch.bfloat16, device="cuda")
+    w0 = (torch.randn(D_out, D_in, dtype=torch.bfloat16, device="cuda") * 0.1).to(torch.bfloat16)
+    r0 = torch.randn(M, D_out, dtype=torch.bfloat16, device="cuda")
+    g = torch.randn(M, D_out, dtype=torch.bfloat16, device="cuda")
 
     a1, w1, r1 = a0.clone().requires_grad_(), w0.clone().requires_grad_(), r0.clone().requires_grad_()
     torch.addmm(r1, a1, w1.t()).backward(g)
@@ -686,54 +685,5 @@ def test_output_proj_residual_backward():
     output_proj_residual(a2, w2, r2).backward(g)
 
     for name, ref, got in [("a", a1.grad, a2.grad), ("w", w1.grad, w2.grad), ("r", r1.grad, r2.grad)]:
-        assert torch.allclose(ref, got, atol=5e-3), \
-            f"{name}.grad max diff {(ref - got).abs().max():.4e}"
-
-
-# ─────────────────────────────────────────────────────────────────────
-# value_gate:  out = v + 3 * sigmoid(x[:, :ch] @ gate_w.T) * ve
-# ─────────────────────────────────────────────────────────────────────
-
-def _value_gate_ref(v, ve, x, gate_w):
-    ve_gate_ch = gate_w.shape[1]
-    gate = 3.0 * torch.sigmoid(x[:, :ve_gate_ch] @ gate_w.t())
-    return v + gate * ve
-
-
-def test_value_gate_forward():
-    torch.manual_seed(0)
-    M, D_v, D_x, ch = 32, 64, 128, 16
-    v = torch.randn(M, D_v, dtype=torch.float32, device="cuda")
-    ve = torch.randn(M, D_v, dtype=torch.float32, device="cuda")
-    x = torch.randn(M, D_x, dtype=torch.float32, device="cuda")
-    gate_w = torch.randn(D_v, ch, dtype=torch.float32, device="cuda") * 0.1
-    out_ref = _value_gate_ref(v, ve, x, gate_w)
-    out_triton = value_gate(v, ve, x, gate_w)
-    assert torch.allclose(out_ref, out_triton, atol=1e-3), \
-        f"max diff {(out_ref - out_triton).abs().max():.4e}"
-
-
-def test_value_gate_backward():
-    torch.manual_seed(0)
-    M, D_v, D_x, ch = 32, 64, 128, 16
-    v0 = torch.randn(M, D_v, dtype=torch.float32, device="cuda")
-    ve0 = torch.randn(M, D_v, dtype=torch.float32, device="cuda")
-    x0 = torch.randn(M, D_x, dtype=torch.float32, device="cuda")
-    gw0 = torch.randn(D_v, ch, dtype=torch.float32, device="cuda") * 0.1
-    g = torch.randn(M, D_v, dtype=torch.float32, device="cuda")
-
-    v1, ve1, x1, gw1 = (t.clone().requires_grad_() for t in (v0, ve0, x0, gw0))
-    _value_gate_ref(v1, ve1, x1, gw1).backward(g)
-
-    v2, ve2, x2, gw2 = (t.clone().requires_grad_() for t in (v0, ve0, x0, gw0))
-    value_gate(v2, ve2, x2, gw2).backward(g)
-
-    atol = 5e-3
-    for name, ref, got in [
-        ("v", v1.grad, v2.grad),
-        ("ve", ve1.grad, ve2.grad),
-        ("x[:, :ch]", x1.grad[:, :ch], x2.grad[:, :ch]),
-        ("gate_w", gw1.grad, gw2.grad),
-    ]:
-        assert torch.allclose(ref, got, atol=atol), \
+        assert torch.allclose(ref, got, atol=2e-2), \
             f"{name}.grad max diff {(ref - got).abs().max():.4e}"
