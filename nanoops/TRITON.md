@@ -1038,9 +1038,8 @@ one launch.
 d24 manual sweep locked `(BLOCK_M=256, BLOCK_N=64, BLOCK_K=32, nw=8,
 st=2)` — single kernel ~639 μs, slightly beating cuBLAS+cast at
 ~654 μs and 2× faster than a naïve Triton `(64,64,64,nw=4,st=3)` at
-~1300 μs. fp32 IEEE path per-stage shared mem is `(256·32 + 64·32)·4
-= 40 KB`, ×2 stages = 80 KB, within the 100 KB SM budget on 3090, so
-the same config is safe for parity tests too.
+~1300 μs. Per-stage shared mem is `(256·32 + 64·32)·4 = 40 KB`, ×2 stages
+= 80 KB, within the 100 KB SM budget on 3090.
 
 #### 3.2.3 Step 2 — `_fused_mlp_proj_residual_fwd_kernel`
 
@@ -1316,17 +1315,10 @@ fire).
 no external Python `dx_total = dx_norm + dy` step and no extra HBM
 round-trip.
 
-**D's config bifurcation + shared-mem budget**: the d24 bf16 sweep
-winner is `(BLOCK_K=64, BLOCK_N=64, nw=4, st=2)`. The fp32 IEEE path
-(which parity tests take) uses a more conservative staging choice, so
-the caller bifurcates on `ieee`:
-
-```python
-if ieee:
-    BLOCK_K_D, BLOCK_N_D, NW_D, ST_D = 64, 64, 8, 3   # fp32-safe (80 KB / 2 stages)
-else:
-    BLOCK_K_D, BLOCK_N_D, NW_D, ST_D = 64, 64, 4, 2   # bf16 winner
-```
+**D's locked config + shared-mem budget**: the d24 bf16 sweep winner is
+`(BLOCK_K=64, BLOCK_N=64, nw=4, st=2)`, now used unconditionally. The old
+fp32 IEEE branch was removed so the training-oriented tensor-core path is the
+only implementation.
 
 This was a trap discovered when we first tried `@triton.autotune`
 across all 6 kernels — autotune ran every candidate, the
@@ -1581,9 +1573,9 @@ The remaining gap between single-op gain and end-to-end gain is:
    data load, Python control flow — none of these are touched by mlp
    fusion or affected by Inductor.
 3. **CUDA Graph capture not yet wired** — locked configs satisfy the
-   prerequisite (no autotune dispatch), but the wrapper still has
-   `if has_nw` / `if ieee` Python branches that need specialization
-   before capture. Another +1-2% possible.
+   prerequisite (no autotune dispatch). The old fp32 IEEE branch is gone;
+   remaining capture work is outside this MLP precision path. Another +1-2%
+   possible.
 
 But op-level 1.09× (higher after cast fusion) + end-to-end +3.3% is
 real savings. At this point in production-grade kernel work, the
@@ -1633,14 +1625,9 @@ from 53% up to 70+%).
    activation dtype mismatch is fully absorbed inside the Triton
    kernels.
 
-7. **Compute the shared-mem budget along the dtype path** — a sweep
-   winner for the bf16 path can exceed 100 KB on the fp32 IEEE path,
-   and Triton **silently miscompiles** (doesn't fail the launch,
-   just produces wrong answers). Step D had to bifurcate configs in
-   the caller on `ieee`. autotune dispatch can't avoid this trap (it
-   runs every candidate and picks the "fastest", including wrong
-   ones), so manual sweeps + caller-locked configs are the only safe
-   path.
+7. **Compute the shared-mem budget along the dtype path** — autotune dispatch
+   can still try over-budget candidates and pick a "fast" wrong result. Manual
+   sweeps plus caller-locked configs remain the safer path.
 
 8. **atomic_add is free on small target buffers** — L2-friendly,
    hardware atomic units handle contention. Simpler than

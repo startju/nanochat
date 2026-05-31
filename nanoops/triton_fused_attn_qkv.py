@@ -46,13 +46,11 @@ _QKV_BWD_QK_PRE_NO_VE_NUM_STAGES = 1
 _QKV_BWD_DX_HAT_VE_BLOCK_M = 128
 _QKV_BWD_DX_HAT_VE_BLOCK_K = 64
 _QKV_BWD_DX_HAT_VE_HEAD_SPLIT = 4
-_QKV_BWD_DX_HAT_VE_CAST_WEIGHTS = False
 _QKV_BWD_DX_HAT_VE_NUM_WARPS = 4
 _QKV_BWD_DX_HAT_VE_NUM_STAGES = 1
 _QKV_BWD_DX_HAT_NO_VE_BLOCK_M = 128
 _QKV_BWD_DX_HAT_NO_VE_BLOCK_K = 64
 _QKV_BWD_DX_HAT_NO_VE_HEAD_SPLIT = 4
-_QKV_BWD_DX_HAT_NO_VE_CAST_WEIGHTS = False
 _QKV_BWD_DX_HAT_NO_VE_NUM_WARPS = 4
 _QKV_BWD_DX_HAT_NO_VE_NUM_STAGES = 1
 
@@ -1237,7 +1235,6 @@ def _norm_qkv_projection_with_residual_mix_bwd_impl(
         DX_HAT_BLOCK_M = _QKV_BWD_DX_HAT_VE_BLOCK_M
         DX_HAT_BLOCK_K = _QKV_BWD_DX_HAT_VE_BLOCK_K
         DX_HAT_HEAD_SPLIT = _QKV_BWD_DX_HAT_VE_HEAD_SPLIT
-        DX_HAT_CAST_WEIGHTS = _QKV_BWD_DX_HAT_VE_CAST_WEIGHTS
         DX_HAT_NUM_WARPS = _QKV_BWD_DX_HAT_VE_NUM_WARPS
         DX_HAT_NUM_STAGES = _QKV_BWD_DX_HAT_VE_NUM_STAGES
     else:
@@ -1247,7 +1244,6 @@ def _norm_qkv_projection_with_residual_mix_bwd_impl(
         DX_HAT_BLOCK_M = _QKV_BWD_DX_HAT_NO_VE_BLOCK_M
         DX_HAT_BLOCK_K = _QKV_BWD_DX_HAT_NO_VE_BLOCK_K
         DX_HAT_HEAD_SPLIT = _QKV_BWD_DX_HAT_NO_VE_HEAD_SPLIT
-        DX_HAT_CAST_WEIGHTS = _QKV_BWD_DX_HAT_NO_VE_CAST_WEIGHTS
         DX_HAT_NUM_WARPS = _QKV_BWD_DX_HAT_NO_VE_NUM_WARPS
         DX_HAT_NUM_STAGES = _QKV_BWD_DX_HAT_NO_VE_NUM_STAGES
     X_NORM_BLOCK_M = _QKV_BWD_X_NORM_BLOCK_M
@@ -1327,17 +1323,8 @@ def _norm_qkv_projection_with_residual_mix_bwd_impl(
         num_stages=QK_PRE_NUM_STAGES,
     )
     # Phase 3: project Q/K/V grads back to x_hat and accumulate RMS row inner.
-    # d24 uses half-head tiles with fp32 master weights loaded inline. This
-    # avoids full Q/K/V weight cast launches while keeping VE/no-VE tile shapes
-    # independently tunable.
-    if DX_HAT_CAST_WEIGHTS:
-        q_weight_for_dx_hat = q_weight.to(x_norm.dtype)
-        k_weight_for_dx_hat = k_weight.to(x_norm.dtype)
-        v_weight_for_dx_hat = v_weight.to(x_norm.dtype)
-    else:
-        q_weight_for_dx_hat = q_weight
-        k_weight_for_dx_hat = k_weight
-        v_weight_for_dx_hat = v_weight
+    # d24 uses half-head tiles and loads projection weights in their native
+    # dtype; the Triton kernel casts tiles to activation dtype where needed.
     wrap_triton(_norm_qkv_projection_dx_hat_bwd_kernel)[
         (triton.cdiv(M, DX_HAT_BLOCK_M), triton.cdiv(K, DX_HAT_BLOCK_K))
     ](
@@ -1345,9 +1332,9 @@ def _norm_qkv_projection_with_residual_mix_bwd_impl(
         d_k_pre,
         d_v,
         dx_hat_ve_for_kernel,
-        q_weight_for_dx_hat,
-        k_weight_for_dx_hat,
-        v_weight_for_dx_hat,
+        q_weight,
+        k_weight,
+        v_weight,
         dx_hat,
         x_norm,
         outer_rms_row_inner,

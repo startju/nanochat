@@ -1,6 +1,20 @@
-"""Attention output Triton kernels for nanoops.
+"""Attention-output Triton kernels for nanoops.
 
-Contains `attn_output_proj_residual` (c_proj + residual).
+Contains `attn_output_proj_residual`, the output-projection side of attention:
+
+    y = residual + attn_out @ proj_weight.T
+
+Public tensors use flattened `(M, D)` layout, where `M = B*T` for the
+training path:
+
+  - `attn_out`: `(M, D_in)`, CUDA contiguous, dtype is activation dtype.
+  - `proj_weight`: `(D_out, D_in)`, CUDA contiguous, usually fp32 master
+    weights or activation dtype.
+  - `residual`: `(M, D_out)`, CUDA contiguous, activation dtype.
+  - return: `(M, D_out)`, dtype=`attn_out.dtype`.
+
+Backward returns `d_attn_out = dy @ proj_weight` and
+`d_proj_weight = dy.T @ attn_out`; residual's gradient is the direct `dy`.
 """
 
 from __future__ import annotations
@@ -20,12 +34,19 @@ except ImportError:
 
 
 # ─────────────────────────────────────────────────────────────────────
-# Small Triton kernels covering the remaining attention/MLP elementwise
-# chains. None of these are big wins individually (each saves ~10-50 µs
-# per layer of kernel-launch + HBM round-trip overhead), but together
-# they cover the last "all eager" pieces of nanchat's attention forward,
-# letting us claim attention is "fully Triton-fused" in the sense that
-# every per-element operation has a Triton kernel.
+# Attention output projection + residual.
+#
+# Forward math for flattened row m and output channel o:
+#   y[m, o] = residual[m, o] + Σ_i attn_out[m, i] * proj_weight[o, i]
+#
+# Backward math:
+#   d_attn_out[m, i]    = Σ_o dy[m, o] * proj_weight[o, i]
+#   d_proj_weight[o, i] = Σ_m dy[m, o] * attn_out[m, i]
+#   d_residual[m, o]    = dy[m, o]
+#
+# d_attn_out and d_proj_weight use separate kernels because their reductions
+# are over different axes. d_proj_weight is owned by `(D_out, D_in)` tiles and
+# reduces over M internally, so it does not need atomics.
 # ─────────────────────────────────────────────────────────────────────
 
 if _HAS_TRITON:
@@ -49,10 +70,10 @@ if _HAS_TRITON:
 
     @triton.jit
     def _attn_output_proj_residual_fwd_kernel(
-        attn_out_ptr,  # (M, D_in) — in: attention output
-        proj_w_ptr,  # (D_out, D_in) — in: output projection weight
-        residual_ptr,  # (M, D_out) — in: residual stream
-        y_ptr,  # (M, D_out) — out: residual + attn_out @ W.T
+        attn_out_ptr,  # (M, D_in), activation dtype — in: attention output
+        proj_w_ptr,  # (D_out, D_in), weight dtype — in: output projection weight
+        residual_ptr,  # (M, D_out), activation dtype — in: residual stream
+        y_ptr,  # (M, D_out), activation dtype — out
         M,  # int — row count after flattening leading dims
         D_OUT: tl.constexpr,  # projection output width
         D_IN: tl.constexpr,  # projection input width
@@ -60,11 +81,11 @@ if _HAS_TRITON:
         BLOCK_DOUT: tl.constexpr,
         BLOCK_DIN: tl.constexpr,
     ):
-        """Fused y = residual + attn_out @ W_proj.T.
+        """Fused `y = residual + attn_out @ proj_weight.T`.
 
-        Standard tiled matmul with the residual loaded into the
-        accumulator at start instead of zero-init. Same idea as cuBLAS
-        `addmm` but in our Triton stack.
+        Standard tiled matmul; projection weight is cast to the activation
+        dtype on load for tensor-core matmuls when the master weight is fp32.
+        Residual is added after casting the accumulator back to output dtype.
         """
         pid_m = tl.program_id(0)
         pid_d = tl.program_id(1)
@@ -104,9 +125,9 @@ if _HAS_TRITON:
 
     @triton.jit
     def _attn_output_proj_residual_dattn_bwd_kernel(
-        proj_w_ptr,  # (D_out, D_in) — in: projection weight
-        dy_ptr,  # (M, D_out) — in: output gradient
-        d_attn_out_ptr,  # (M, D_in) — out: dy @ proj_weight
+        proj_w_ptr,  # (D_out, D_in), weight dtype — in: projection weight
+        dy_ptr,  # (M, D_out), activation dtype — in: output gradient
+        d_attn_out_ptr,  # (M, D_in), activation dtype — out
         M,  # int — row count after flattening leading dims
         D_OUT: tl.constexpr,  # projection output width
         D_IN: tl.constexpr,  # projection input width
@@ -114,7 +135,7 @@ if _HAS_TRITON:
         BLOCK_DOUT: tl.constexpr,
         BLOCK_DIN: tl.constexpr,
     ):
-        """Compute d_attn_out = dy @ proj_weight."""
+        """Compute `d_attn_out = dy @ proj_weight`."""
         pid_m = tl.program_id(0)
         pid_din = tl.program_id(1)
         rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -152,9 +173,9 @@ if _HAS_TRITON:
 
     @triton.jit
     def _attn_output_proj_residual_dweight_bwd_kernel(
-        attn_out_ptr,  # (M, D_in) — in: forward attention output
-        dy_ptr,  # (M, D_out) — in: output gradient
-        d_proj_w_ptr,  # (D_out, D_in) — out: dy.T @ attn_out
+        attn_out_ptr,  # (M, D_in), activation dtype — in: forward attention output
+        dy_ptr,  # (M, D_out), activation dtype — in: output gradient
+        d_proj_w_ptr,  # (D_out, D_in), proj_weight dtype — out
         M,  # int — row count after flattening leading dims
         D_OUT: tl.constexpr,  # projection output width
         D_IN: tl.constexpr,  # projection input width
@@ -162,7 +183,7 @@ if _HAS_TRITON:
         BLOCK_DOUT: tl.constexpr,
         BLOCK_DIN: tl.constexpr,
     ):
-        """Compute d_proj_weight = dy.T @ attn_out without atomics."""
+        """Compute `d_proj_weight = dy.T @ attn_out` without atomics."""
         pid_dout = tl.program_id(0)
         pid_din = tl.program_id(1)
         dout_cols = pid_dout * BLOCK_DOUT + tl.arange(0, BLOCK_DOUT)
@@ -198,15 +219,15 @@ def _attn_output_proj_residual_fwd_impl(
     proj_weight: torch.Tensor,
     residual: torch.Tensor,
 ) -> torch.Tensor:
-    """Run `y = residual + attn_out @ proj_weight.T`.
+    """Launch the attention-output projection forward kernel.
 
     Args:
-      attn_out: (M, D_in) contiguous CUDA tensor.
-      proj_weight: (D_out, D_in) contiguous projection weight.
-      residual: (M, D_out) contiguous residual stream tensor.
+      attn_out: `(M, D_in)` contiguous CUDA tensor, activation dtype.
+      proj_weight: `(D_out, D_in)` contiguous CUDA tensor, weight dtype.
+      residual: `(M, D_out)` contiguous CUDA tensor, activation dtype.
 
     Returns:
-      (M, D_out) projected residual output.
+      `y`: `(M, D_out)` tensor, dtype=`attn_out.dtype`.
     """
     if not _HAS_TRITON:
         raise RuntimeError("attn_output_proj_residual requires triton")
@@ -245,16 +266,16 @@ def _attn_output_proj_residual_bwd_impl(
     attn_out: torch.Tensor,
     proj_weight: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compute gradients for `y = residual + attn_out @ proj_weight.T`.
+    """Launch backward kernels for `y = residual + attn_out @ proj_weight.T`.
 
     Args:
-      dy: (M, D_out) gradient of output.
-      attn_out: (M, D_in) saved forward attention output.
-      proj_weight: (D_out, D_in) saved projection weight.
+      dy: `(M, D_out)` gradient of output. Made contiguous before launch.
+      attn_out: `(M, D_in)` saved forward attention output.
+      proj_weight: `(D_out, D_in)` saved projection weight.
 
     Returns:
-      d_attn_out: (M, D_in), `dy @ proj_weight`.
-      d_proj_weight: (D_out, D_in), `dy.T @ attn_out`.
+      d_attn_out: `(M, D_in)`, dtype=`attn_out.dtype`.
+      d_proj_weight: `(D_out, D_in)`, dtype=`proj_weight.dtype`.
     """
     if not _HAS_TRITON:
         raise RuntimeError("attn_output_proj_residual backward requires triton")
@@ -314,7 +335,16 @@ def _attn_output_proj_residual_fwd_op(
     proj_weight: torch.Tensor,
     residual: torch.Tensor,
 ) -> torch.Tensor:
-    """Triton-op forward wrapper for output projection + residual add."""
+    """Triton-op forward wrapper.
+
+    Args:
+      attn_out: `(M, D_in)` contiguous CUDA tensor.
+      proj_weight: `(D_out, D_in)` contiguous CUDA tensor.
+      residual: `(M, D_out)` contiguous CUDA tensor.
+
+    Returns:
+      `(M, D_out)` tensor, dtype=`attn_out.dtype`.
+    """
     return _attn_output_proj_residual_fwd_impl(attn_out, proj_weight, residual)
 
 
@@ -327,7 +357,17 @@ def _attn_output_proj_residual_bwd_op(
     attn_out: torch.Tensor,
     proj_weight: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Triton-op backward wrapper returning `(d_attn_out, d_proj_weight)`."""
+    """Triton-op backward wrapper.
+
+    Args:
+      dy: `(M, D_out)` output gradient.
+      attn_out: `(M, D_in)` saved forward attention output.
+      proj_weight: `(D_out, D_in)` saved projection weight.
+
+    Returns:
+      `(d_attn_out, d_proj_weight)` with shapes `(M, D_in)` and
+      `(D_out, D_in)`.
+    """
     return _attn_output_proj_residual_bwd_impl(dy, attn_out, proj_weight)
 
 
@@ -336,7 +376,7 @@ def _attn_output_proj_residual_setup_context(
     inputs: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
     output: torch.Tensor,
 ) -> None:
-    """Save tensors for output projection backward."""
+    """Save forward tensors needed by the Triton-op autograd callback."""
     attn_out, proj_weight, _residual = inputs
     ctx.save_for_backward(attn_out, proj_weight)
 
@@ -345,7 +385,15 @@ def _attn_output_proj_residual_autograd_backward(
     ctx: Any,
     grad_y: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Autograd callback for `nanoops::attn_output_proj_residual_fwd`."""
+    """Autograd callback for `nanoops::attn_output_proj_residual_fwd`.
+
+    Args:
+      grad_y: `(M, D_out)` gradient of public output.
+
+    Returns:
+      Gradients for `(attn_out, proj_weight, residual)`. The residual
+      gradient is the direct passthrough `grad_y`.
+    """
     attn_out, proj_weight = ctx.saved_tensors
     d_attn_out, d_proj_weight = _attn_output_proj_residual_bwd_op(
         grad_y,
@@ -369,12 +417,12 @@ def attn_output_proj_residual(
     """Fused `y = residual + attn_out @ proj_weight.T`.
 
     Args:
-      attn_out: (M, D_in) CUDA tensor.
-      proj_weight: (D_out, D_in) projection weight.
-      residual: (M, D_out) residual stream tensor.
+      attn_out: `(M, D_in)` CUDA tensor, activation dtype.
+      proj_weight: `(D_out, D_in)` projection weight tensor.
+      residual: `(M, D_out)` residual stream tensor.
 
     Returns:
-      (M, D_out) projected residual output.
+      `(M, D_out)` projected residual output, dtype=`attn_out.dtype`.
     """
     assert attn_out.ndim == proj_weight.ndim == residual.ndim == 2
     attn_out = attn_out.contiguous()

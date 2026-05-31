@@ -1,6 +1,16 @@
 """Attention SDPA-side Triton kernels for nanoops.
 
-Contains `attn_sdpa`: Flash-style sliding-causal SDPA with a split backward.
+Contains `attn_sdpa`: Flash-style sliding-causal scaled dot-product attention
+for training. Public tensors use `(B, T, H, D)` layout:
+
+  - `q`: `(B, T, H_q, D)`, CUDA contiguous, dtype in {bf16, fp16, fp32}.
+  - `k`: `(B, T, H_kv, D)`, CUDA contiguous, same dtype family as `q`.
+  - `v`: `(B, T, H_kv, D)`, CUDA contiguous, same shape as `k`.
+  - return: `(B, T, H_q, D)`, dtype=`q.dtype`.
+
+`H_q` may be larger than `H_kv` for GQA; `H_q % H_kv == 0`.
+The backward is split into FlashAttention-style `delta`, `dQ`, and `dK/dV`
+passes so each output gradient tile has one owner and dK/dV do not need atomics.
 """
 
 from __future__ import annotations
@@ -22,7 +32,14 @@ except ImportError:
 def _pick_attn_sdpa_fwd_tile_config(
     head_dim: int,
 ) -> tuple[int, int, int, int]:
-    """Return `(block_m, block_n, num_warps, num_stages)` for SDPA forward."""
+    """Return `(block_m, block_n, num_warps, num_stages)` for SDPA forward.
+
+    Args:
+      head_dim: Attention head width `D`.
+
+    Returns:
+      Tile and launch parameters for `_attn_sdpa_fwd_kernel`.
+    """
     if head_dim >= 128:
         # d24 forward sweep winner (B=1, T=2048, H=12, D=128, bf16).
         return 128, 64, 8, 1
@@ -32,7 +49,14 @@ def _pick_attn_sdpa_fwd_tile_config(
 def _pick_attn_sdpa_bwd_tile_config(
     head_dim: int,
 ) -> tuple[int, int, int, int]:
-    """Return `(block_m, block_n, num_warps, num_stages)` for split SDPA backward."""
+    """Return `(block_m, block_n, num_warps, num_stages)` for split SDPA backward.
+
+    Args:
+      head_dim: Attention head width `D`.
+
+    Returns:
+      Tile and launch parameters shared by delta/dQ/dK/dV backward kernels.
+    """
     if head_dim >= 128:
         # d24 split-bwd sweep winner. Larger forward tiles OOR in dKV.
         return 32, 32, 4, 1
@@ -40,7 +64,16 @@ def _pick_attn_sdpa_bwd_tile_config(
 
 
 def _pick_attn_sdpa_gqa_block_m(block_m: int, gqa_group: int) -> int:
-    """Keep total `(query rows × grouped heads)` similar to the baseline tile."""
+    """Return per-head `BLOCK_M` after packing GQA query heads together.
+
+    Args:
+      block_m: Baseline row tile before GQA packing.
+      gqa_group: Number of query heads sharing one K/V head (`H_q // H_kv`).
+
+    Returns:
+      Per-query-head row tile. A program then handles
+      `BLOCK_M * GQA_GROUP` logical Q rows after flattening.
+    """
     return max(8, block_m // gqa_group)
 
 
@@ -49,13 +82,14 @@ def _pick_attn_sdpa_gqa_block_m(block_m: int, gqa_group: int) -> int:
 #
 # Standard Flash Attention pattern, adapted for nanchat's sliding-causal mask.
 #
-# Forward math for one (batch, head), with i indexing query rows and j key rows:
+# Forward math for one batch and one query head. Let i index query rows,
+# j key rows, and d head channels:
 #   visible(i, j) = max(0, i - WINDOW + 1) <= j <= i
-#   S_ij          = sm_scale * dot(Q_i, K_j)          if visible(i, j)
+#   S_ij          = sm_scale * Σ_d Q_i,d K_j,d       if visible(i, j)
 #                 = -inf                             otherwise
 #   P_ij          = exp(S_ij - LSE_i)
 #   LSE_i         = log(sum_j exp(S_ij))
-#   O_i           = sum_j P_ij * V_j
+#   O_i,d         = sum_j P_ij * V_j,d
 #
 # The kernel never materializes S or P as (L, L). It tiles Q by BLOCK_M rows and
 # streams K/V by BLOCK_N rows. For each Q row it maintains an online-softmax
@@ -75,20 +109,20 @@ def _pick_attn_sdpa_gqa_block_m(block_m: int, gqa_group: int) -> int:
 # Backward math, given G = dO, is split into three Triton passes:
 #
 #   Preprocess, Q-row owned:
-#     Delta_i = sum_d O_id * G_id
+#     Delta_i = Σ_d O_i,d * G_i,d
 #
 #   dQ pass, Q-tile owned:
 #     P_ij  = exp(S_ij - LSE_i)              # recomputed from Q/K/LSE
-#     dP_ij = dot(G_i, V_j)
+#     dP_ij = Σ_d G_i,d * V_j,d
 #     dS_ij = P_ij * (dP_ij - Delta_i) * sm_scale
-#     dQ_i += sum_j dS_ij * K_j
+#     dQ_i,d += Σ_j dS_ij * K_j,d
 #
 #   dK/dV pass, K/V-tile owned:
 #     P_ij  = exp(S_ij - LSE_i)
-#     dV_j  = sum_i P_ij * G_i
-#     dP_ij = dot(G_i, V_j)
+#     dV_j,d += Σ_i P_ij * G_i,d
+#     dP_ij = Σ_d G_i,d * V_j,d
 #     dS_ij = P_ij * (dP_ij - Delta_i) * sm_scale
-#     dK_j  = sum_i dS_ij * Q_i
+#     dK_j,d += Σ_i dS_ij * Q_i,d
 #
 # This is the FlashAttention-style split backward: dQ and dK/dV are written by
 # their owning tiles, so dK/dV no longer need atomic accumulation.

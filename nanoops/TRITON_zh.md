@@ -965,9 +965,9 @@ tile 从未物化到 HBM，省掉 36 MB 写回读 + 一次 launch。
 
 d24 manual sweep 锁了 `(BLOCK_M=256, BLOCK_N=64, BLOCK_K=32, nw=8, st=2)`，
 单 kernel ~639 μs，比 cuBLAS+cast 的 ~654 μs 略快、比朴素 Triton
-`(64,64,64,nw=4,st=3)` 的 ~1300 μs 快 2×。fp32 IEEE 路径下 per-stage
-shared mem `(256·32 + 64·32)·4 = 40 KB`，×2 stages = 80 KB，在 3090 SM
-的 100 KB 预算内，所以同一份配置对 parity test 也安全。
+`(64,64,64,nw=4,st=3)` 的 ~1300 μs 快 2×。per-stage shared mem
+`(256·32 + 64·32)·4 = 40 KB`，×2 stages = 80 KB，在 3090 SM 的 100 KB
+预算内。
 
 #### 3.2.3 Step 2 —— `_fused_mlp_proj_residual_fwd_kernel`
 
@@ -1218,16 +1218,9 @@ unlock 了用 BLOCK_M=64、BLOCK_K=64 这种 tensor core 友好的 tile（如果
 **3. outer-residual 折进 store**——`+ dy` 在 kernel 内完成，不需要外面的
 Python `dx_total = dx_norm + dy` 那一步 + 一次额外 HBM round-trip。
 
-**D 的配置分叉 + shared-mem 预算**：bf16 路径 sweep winner 是
-`(BLOCK_K=64, BLOCK_N=64, nw=4, st=2)`。fp32 IEEE 路径（parity test 走的路径）
-用更保守的 staging，所以 caller 里按 `ieee` 分叉：
-
-```python
-if ieee:
-    BLOCK_K_D, BLOCK_N_D, NW_D, ST_D = 64, 64, 8, 3   # fp32-safe (80 KB/2 stages)
-else:
-    BLOCK_K_D, BLOCK_N_D, NW_D, ST_D = 64, 64, 4, 2   # bf16 winner
-```
+**D 的锁定配置 + shared-mem 预算**：bf16 路径 sweep winner 是
+`(BLOCK_K=64, BLOCK_N=64, nw=4, st=2)`，现在无条件使用这一条路径。旧的
+fp32 IEEE 分支已经删掉，MLP 只保留训练导向的 tensor-core 路径。
 
 这是 d24 sweep 时第一波 autotune 全 kernel 撞出来的坑——autotune 会试图
 跑所有候选，shared-mem 超的那些不报错、出错误结果、autotune 选了一个看
@@ -1463,8 +1456,8 @@ d24 + B=1 end-to-end 实测（同 checkpoint resume 5 步均值，3090 ×2）：
    data load、Python 控制流——这些跟 mlp fusion 无关，不会被 inductor
    消掉。
 3. **CUDA Graph capture 还没接**——locked configs 已经具备前提（不用
-   autotune dispatch），但 wrapper 还有 `if has_nw` / `if ieee` 的 Python
-   分支，要 capture 得先 specialize。再 +1-2% 可能。
+   autotune dispatch）。旧的 fp32 IEEE 分支已经删掉，剩余 capture 工作
+   不在这个 MLP 精度分支上。再 +1-2% 可能。
 
 但 op-level 1.09×（cast fusion 后更高）+ end-to-end +3.3% 是真实节省。
 production-grade kernel 写到这个程度，主要的边际优化空间已经枯竭——
@@ -1504,11 +1497,9 @@ production-grade kernel 写到这个程度，主要的边际优化空间已经�
    optimizer 不需要再 `.to()` 把 bf16 grad 升回 fp32。和 #5 是一对：把
    master/activation dtype 不匹配的代价全部塞进 Triton kernel 内联。
 
-7. **shared-mem 预算要按 dtype 路径算**——bf16 路径的 sweep winner 在 fp32
-   IEEE 路径下可能超 100 KB SM 预算，Triton **静默 miscompile**（不报
-   launch 失败、直接出错答案）。Step D 就因此要在 caller 按 `ieee` 分叉
-   两套配置。autotune dispatch 没法避开这个坑（它会试所有候选，挑"最
-   快"的，包括出错的），所以走 manual sweep + caller 锁配置。
+7. **shared-mem 预算要按 dtype 路径算**——autotune dispatch 仍可能试到
+   超预算候选并挑到"最快"但错误的结果，所以 manual sweep + caller 锁配置
+   仍然是更稳的路径。
 
 8. **atomic_add 在 small target buffer 上是免费的**——L2 友好，硬件
    atomic unit 处理 contention。比 scratchpad+reduce 简单且不输。
