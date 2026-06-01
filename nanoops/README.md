@@ -89,14 +89,11 @@ adds optional fast-path variants.
       `concat([c_q.weight, c_k.weight, c_v.weight])`, with Q/K rotary,
       QK RMSNorm, and scale applied before writeback. This covers the
       QKV-side setup before SDPA.
-- [x] **`fused_cross_entropy`**: fused lm-head projection + logit softcap +
-      cross entropy. The training loss path keeps lm-head as one large GEMM,
-      then uses Triton for softcap + CE over raw bf16 logits to avoid the
-      native path's full fp32 softcapped-logits/log-softmax intermediates.
 
 The block-level fused kernels cover the heaviest "norm + linear chain" entries
-of the transformer block; `fused_cross_entropy` covers the memory-heavy
-training loss tail.
+of the transformer block; the old Triton fused CE tail is removed, while the
+standard nanoops functional ops still cover the lm-head/softcap/CE path when
+integration patching is enabled.
 
 ### Conventions for each new op
 

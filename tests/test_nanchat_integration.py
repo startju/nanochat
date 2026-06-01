@@ -73,12 +73,10 @@ def test_nanchat_pytorch_vs_nanoops_loss_curve_matches():
         model_no, x2, t2 = _make_model_and_data(seed=0)
         losses_no = _train_steps(model_no, x2, t2, n_steps=5)
 
-    # Expected magnitude of divergence: ~1e-3 per step.
-    # PyTorch's `F.cross_entropy` uses a single fused C++ kernel; nanoops
-    # decomposes into chunked_logsumexp + gather + scatter, each with its
-    # own fp32 rounding. The cumulative noise across 5 AdamW steps lands
-    # in the ~1e-3 range and stays bounded (doesn't diverge), which is the
-    # mark of "different impl, same math" rather than a bug.
+    # Expected magnitude of divergence: ~1e-3 per step. nanoops decomposes
+    # cross_entropy into chunked_logsumexp + gather + scatter, each with its
+    # own fp32 rounding. The cumulative noise across 5 AdamW steps stays small
+    # and bounded.
     for i, (a, b) in enumerate(zip(losses_pt, losses_no)):
         assert abs(a - b) < 2e-3, \
             f"step {i}: PyTorch loss {a:.6f} vs nanoops loss {b:.6f}  diff={abs(a-b):.2e}"

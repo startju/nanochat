@@ -25,12 +25,12 @@ Patched ops:
   torch top-level attributes:
     torch.sigmoid, torch.tanh
   Module-level functions (replaced directly on the host module):
+    torch.nn.functional.cross_entropy   — direct fully-qualified calls
     nanochat.gpt.apply_rotary_emb
-  Class methods (targeted swaps, can't be reached via F-namespace):
+    Class methods (targeted swaps, can't be reached via F-namespace):
     nanochat.gpt.MLP.forward             — relu_square fused
                                              + optional MLP activation ckpt
     nanochat.gpt.GPT.forward             — optional fused attention QKV path
-                                             + optional fused lm-head CE tail
     nanochat.gpt.CausalSelfAttention.forward
                                           — optional L-layer activation ckpt
     nanochat.optim.DistMuonAdamW._compute_adamw / _compute_muon
@@ -84,10 +84,15 @@ _TORCH_OVERRIDES = {
 }
 
 
-# Module-level functions in nanchat that have nanoops equivalents but are NOT
-# looked up via F namespace (so the F-namespace patch doesn't touch them).
+# Module-level functions that have nanoops equivalents but are NOT always
+# looked up via a patched module-local F namespace.
 # Format: (module_path, attr_name) -> replacement.
 _MODULE_FUNC_OVERRIDES = {
+    # Some eval code uses the fully-qualified spelling
+    # `torch.nn.functional.cross_entropy(...)`, bypassing the module-local F
+    # proxy. Patch that function while NANOOPS=1 is active so CE also follows
+    # the nanoops-first policy outside the training GPT.forward path.
+    ("torch.nn.functional", "cross_entropy"): nF.cross_entropy,
     # nanchat defines apply_rotary_emb as a top-level function in gpt.py and
     # calls it directly via module lookup (`gpt.apply_rotary_emb(...)`).
     # Replacing this attribute swaps in nanoops's autograd Function version.
@@ -166,7 +171,6 @@ _orig_norm = None
 _fused_mlp = None
 _fused_attn_qkv = None
 _fused_attn_tail = None
-_fused_cross_entropy = None
 
 
 def _rms_norm_no_weight(x: torch.Tensor) -> torch.Tensor:
@@ -311,37 +315,11 @@ def _patched_gpt_forward(self, idx, targets=None, kv_cache=None, loss_reduction=
         if i == backout_layer:
             x_backout = x
 
-    if targets is not None:
-        if _fused_cross_entropy is not None and x_backout is not None:
-            return _fused_cross_entropy(
-                x.contiguous(),
-                self.lm_head.weight.contiguous(),
-                targets.contiguous(),
-                self.config.vocab_size,
-                15.0,
-                -1,
-                loss_reduction,
-                x_backout=x_backout.contiguous(),
-                backout_scale=self.backout_lambda,
-                eps=1e-6,
-            )
-
     if x_backout is not None:
         x = x - self.backout_lambda.to(x.dtype) * x_backout
     x = _rms_norm_no_weight(x)
 
     if targets is not None:
-        if _fused_cross_entropy is not None:
-            return _fused_cross_entropy(
-                x.contiguous(),
-                self.lm_head.weight.contiguous(),
-                targets.contiguous(),
-                self.config.vocab_size,
-                15.0,
-                -1,
-                loss_reduction,
-            )
-
         softcap = 15
         logits = self.lm_head(x)
         logits = logits[..., : self.config.vocab_size]
@@ -433,7 +411,7 @@ def _apply() -> dict[str, dict]:
     instead of the true originals.
     """
     global _PATCHED, _orig_attn_forward, _orig_gpt_forward, _orig_norm
-    global _fused_mlp, _fused_attn_qkv, _fused_attn_tail, _fused_cross_entropy
+    global _fused_mlp, _fused_attn_qkv, _fused_attn_tail
     if _PATCHED:
         raise RuntimeError(
             "nanoops.integration already patched; call _restore() before _apply() again"
@@ -491,10 +469,6 @@ def _apply() -> dict[str, dict]:
         _orig_gpt_forward = gpt_mod.GPT.forward
         _fused_attn_qkv = _nqp
         _fused_attn_tail = _tail
-        if os.environ.get("NANOOPS_FUSED_CROSS_ENTROPY"):
-            from .triton_fused_cross_entropy import fused_cross_entropy as _fce
-
-            _fused_cross_entropy = _fce
         originals["method"][("nanochat.gpt", "GPT", "forward")] = _orig_gpt_forward
         gpt_mod.GPT.forward = _patched_gpt_forward
     # L-layer activation checkpoint: opt-in via NANOOPS_L_ATTN_CHECKPOINT=1.
@@ -554,7 +528,7 @@ def _restore(originals: dict[str, dict]) -> None:
         cls = getattr(importlib.import_module(modname), cls_name)
         setattr(cls, method_name, original)
     global _PATCHED, _orig_attn_forward, _orig_gpt_forward, _orig_norm
-    global _fused_mlp, _fused_attn_qkv, _fused_attn_tail, _fused_cross_entropy
+    global _fused_mlp, _fused_attn_qkv, _fused_attn_tail
     _PATCHED = False
     _orig_attn_forward = None
     _orig_gpt_forward = None
@@ -562,7 +536,6 @@ def _restore(originals: dict[str, dict]) -> None:
     _fused_mlp = None
     _fused_attn_qkv = None
     _fused_attn_tail = None
-    _fused_cross_entropy = None
 
 
 def patch_nanchat() -> list[str]:
@@ -584,10 +557,6 @@ def patch_nanchat() -> list[str]:
         names.append("Block.forward(fused_mlp — supersedes relu_square fusion)")
     if os.environ.get("NANOOPS_FUSED_ATTN"):
         names.append("GPT.forward(fused_attn_qkv_projection + fused_attn_spda_and_output fused)")
-    if os.environ.get("NANOOPS_FUSED_ATTN") and os.environ.get(
-        "NANOOPS_FUSED_CROSS_ENTROPY"
-    ):
-        names.append("GPT.forward(fused_cross_entropy loss tail)")
     return names
 
 

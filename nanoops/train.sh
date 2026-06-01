@@ -39,8 +39,9 @@ export NANOOPS_OFFLOAD_OPTIM="${NANOOPS_OFFLOAD_OPTIM:-1}"
 
 if [ -n "$NANOOPS_FUSED" ]; then
     # Full-fuse d24 path for performance runs: use fused MLP + fused QKV
-    # + fused SDPA/output tail + fused softcap CE tail, but do not
-    # activation-checkpoint MLP or full-attention layers.
+    # + fused SDPA/output tail, but do not activation-checkpoint MLP or
+    # full-attention layers. The old Triton fused CE tail is removed; the
+    # standard nanoops functional ops remain the first choice for the loss tail.
     #
     # Current d24 + B=1 + 2x RTX 3090 run, after compile/eval warmup:
     #   dt        ~55.8 s/step
@@ -51,7 +52,6 @@ if [ -n "$NANOOPS_FUSED" ]; then
     export NANOOPS_L_ATTN_CHECKPOINT=
     export NANOOPS_FUSED_MLP=1
     export NANOOPS_FUSED_ATTN=1
-    export NANOOPS_FUSED_CROSS_ENTROPY="${NANOOPS_FUSED_CROSS_ENTROPY:-1}"
 else
     # Checkpoint-heavy d24 path. This keeps the historical defaults:
     # fused kernels are enabled, and activation checkpointing is on to
