@@ -57,9 +57,9 @@ _QKV_BWD_DX_HAT_NO_VE_NUM_STAGES = 1
 _QKV_BWD_X_NORM_BLOCK_M = 128
 _QKV_BWD_X_NORM_BLOCK_K = 64
 _QKV_BWD_X_NORM_NUM_WARPS = 4
-_QKV_BWD_OUTER_RMS_BLOCK_M = 128
-_QKV_BWD_OUTER_RMS_BLOCK_K = 64
-_QKV_BWD_OUTER_RMS_NUM_WARPS = 4
+_QKV_BWD_OUTER_RMS_BLOCK_M = 16
+_QKV_BWD_OUTER_RMS_BLOCK_K = 128
+_QKV_BWD_OUTER_RMS_NUM_WARPS = 8
 _QKV_BWD_WEIGHT_GRAD_BLOCK_N = 64
 _QKV_BWD_WEIGHT_GRAD_BLOCK_K = 128
 _QKV_BWD_WEIGHT_GRAD_BLOCK_M = 32
@@ -775,9 +775,9 @@ if _HAS_TRITON:
             mask=mask,
             other=0.0,
         )
-        dx_mix = x_rms_inv[:, None] * (
+        dx_mix = (x_rms_inv[:, None] * (
             dx_hat - x_norm * outer_rms_row_inner[:, None]
-        )
+        )).to(dx_hat.dtype)
         grad_x_mix = tl.load(grad_x_mix_ptr + offs, mask=mask, other=0.0)
         dx_mix += grad_x_mix
 
@@ -785,28 +785,33 @@ if _HAS_TRITON:
         x0_scale = tl.load(x0_scale_ptr).to(dx_mix.dtype)
         tl.store(
             dx_ptr + offs,
-            (dx_mix * resid_scale).to(dx_ptr.dtype.element_ty),
+            dx_mix * resid_scale,
             mask=mask,
         )
         tl.store(
             dx0_ptr + offs,
-            (dx_mix * x0_scale).to(dx0_ptr.dtype.element_ty),
+            dx_mix * x0_scale,
             mask=mask,
         )
 
         x_base = tl.load(x_base_ptr + offs, mask=mask, other=0.0)
         x0 = tl.load(x0_ptr + offs, mask=mask, other=0.0)
-        dx_mix_f32 = dx_mix.to(tl.float32)
-        d_resid_rows = tl.sum(dx_mix_f32 * x_base.to(tl.float32), axis=1)
-        d_x0_rows = tl.sum(dx_mix_f32 * x0.to(tl.float32), axis=1)
+        d_resid_scale_tile = tl.sum(
+            tl.sum(dx_mix * x_base, axis=1, dtype=tl.float32),
+            axis=0,
+        )
+        d_x0_scale_tile = tl.sum(
+            tl.sum(dx_mix * x0, axis=1, dtype=tl.float32),
+            axis=0,
+        )
         tl.atomic_add(
             d_resid_scale_ptr,
-            tl.sum(d_resid_rows, axis=0),
+            d_resid_scale_tile,
             sem="relaxed",
         )
         tl.atomic_add(
             d_x0_scale_ptr,
-            tl.sum(d_x0_rows, axis=0),
+            d_x0_scale_tile,
             sem="relaxed",
         )
 
