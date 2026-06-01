@@ -61,6 +61,31 @@ with two intertwined goals:
    allocator, the fused path lets consumer 24 GiB GPUs run d24 while also
    improving the compiled training step.
 
+### What's inside `nanoops/`
+
+`nanoops/` is split into a readable Python teaching layer, a Triton full-fuse
+training layer, integration scripts, and docs:
+
+| File | What it contains | Role |
+| ---- | ---------------- | ---- |
+| `nanoops/__init__.py` | Package exports for `nanoops.nn` and `nanoops.functional`. | Lets code switch imports from PyTorch-style namespaces to nanoops. |
+| `nanoops/functional.py` | Custom `torch.autograd.Function` implementations for `linear`, `embedding`, `rms_norm`, `softmax`, `cross_entropy`, SDPA, rotary, elementwise ops, and helpers. | Teaching/reference layer that opens the PyTorch black boxes with explicit forward/backward code. |
+| `nanoops/nn.py` | Module wrappers such as `Linear` and `Embedding`. | `torch.nn`-style API backed by `nanoops.functional`. |
+| `nanoops/integration.py` | Monkey-patching for nanchat's `F` namespace, selected `torch.*` calls, GPT/Block/MLP forwards, fused attention/MLP paths, activation checkpoint hooks, and optimizer offload hooks. | Turns nanoops on in `scripts/base_train.py` via `NANOOPS=1` without editing upstream model code. |
+| `nanoops/cpu_offload.py` | Pinned-CPU optimizer-state offload for `MuonAdamW` and `DistMuonAdamW`. | Keeps d24 optimizer state off GPU while preserving the existing fused optimizer kernels. |
+| `nanoops/triton_fused_add_norm.py` | `fused_add_norm` plus shared tile-sizing helpers. | Standalone add+RMSNorm op and shared RMSNorm tiling utility for other Triton kernels. |
+| `nanoops/triton_fused_mlp.py` | `fused_mlp`: RMSNorm, `c_fc`, ReLU², `c_proj`, residual add, and backward. | Full Triton MLP block path used by `NANOOPS_FUSED_MLP=1`. |
+| `nanoops/triton_fused_attn_qkv.py` | `fused_attn_qkv_projection`: residual/x0 mix, RMSNorm, separate Q/K/V projections, rotary, Q/K norm+scale, optional value embedding, and backward. | Attention input-side fusion used by `NANOOPS_FUSED_ATTN=1`. |
+| `nanoops/triton_fused_attn_spda.py` | Flash-style SDPA forward/backward kernels for `(B, T, H, D)` tensors with GQA and sliding-causal windows. | Internal SDPA engine used by the fused attention output op. |
+| `nanoops/triton_fused_attn_spda_and_output.py` | `fused_attn_spda_and_output`: SDPA plus output projection/residual tail and matching backward handoff. | Attention output-side fusion used by `NANOOPS_FUSED_ATTN=1`. |
+| `nanoops/train.sh` | Default d24 launch script. | Runs full-fuse B=2 training on 2x 24 GiB GPUs, with CPU optimizer offload and checkpoint cadence set. |
+| `nanoops/train_profile.sh` | Nsight Systems profiling wrapper for short compiled training windows. | Captures steady-state fused-kernel traces without tracing setup/eval noise. |
+| `nanoops/README.md` / `README_zh.md` | Op-by-op notes, TODOs, math, and teaching explanations. | Main nanoops documentation. |
+| `nanoops/TRITON.md` / `TRITON_zh.md` | Triton kernel design guide and RTX 3090 hardware budget. | Explains the hardware model and fusion trade-offs. |
+| `nanoops/TRITON_MLP.md` / `TRITON_MLP_zh.md` | Fused MLP design notes. | Documents the MLP forward/backward decomposition and tuning choices. |
+| `nanoops/TRITON_QKV.md` / `TRITON_QKV_zh.md` | Fused attention QKV-side design notes. | Documents residual mix, RMSNorm, QKV projection, rotary/QK norm, VE, and backward math. |
+| `nanoops/TRITON_SPDA_OUTPUT.md` / `TRITON_SPDA_OUTPUT_zh.md` | Fused SDPA/output design notes. | Documents Flash-style SDPA, GQA/sliding-window handling, output projection, delta, and backward. |
+
 ### What this means in practice
 
 **`--depth=24` is nanchat's reference model size — and consumer-grade

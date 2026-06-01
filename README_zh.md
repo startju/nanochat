@@ -51,6 +51,31 @@ H100 只有在 **wall-time per run 超过 debug 迭代时间**时才划算——
    expandable-segments allocator，消费级 24 GiB GPU 既能装下 d24，也能把
    编译后的训练 step 往前推。
 
+### `nanoops/` 目录里有什么
+
+`nanoops/` 分成可读的 Python 教学层、Triton full-fuse 训练层、集成脚本和
+文档：
+
+| 文件 | 内容 | 作用 |
+| ---- | ---- | ---- |
+| `nanoops/__init__.py` | 导出 `nanoops.nn` 和 `nanoops.functional`。 | 让代码可以按 PyTorch 风格 namespace 切到 nanoops。 |
+| `nanoops/functional.py` | `linear`、`embedding`、`rms_norm`、`softmax`、`cross_entropy`、SDPA、rotary、elementwise op 等自定义 `torch.autograd.Function`。 | 教学/reference 层，把 PyTorch 黑盒算子的 forward/backward 展开。 |
+| `nanoops/nn.py` | `Linear`、`Embedding` 等 module wrapper。 | `torch.nn` 风格 API，底层调用 `nanoops.functional`。 |
+| `nanoops/integration.py` | patch nanchat 的 `F` namespace、部分 `torch.*` 调用、GPT/Block/MLP forward、fused attention/MLP、activation checkpoint 和 optimizer offload hook。 | 通过 `NANOOPS=1` 接入 `scripts/base_train.py`，不改 upstream 模型代码。 |
+| `nanoops/cpu_offload.py` | `MuonAdamW` / `DistMuonAdamW` 的 pinned-CPU optimizer-state offload。 | 把 d24 optimizer state 放到 CPU，同时继续复用原来的 fused optimizer kernel。 |
+| `nanoops/triton_fused_add_norm.py` | `fused_add_norm` 和共享 tile-sizing helper。 | 独立 add+RMSNorm op，也给其他 Triton kernel 复用 RMSNorm tile 选择。 |
+| `nanoops/triton_fused_mlp.py` | `fused_mlp`：RMSNorm、`c_fc`、ReLU²、`c_proj`、residual add 和 backward。 | `NANOOPS_FUSED_MLP=1` 使用的完整 Triton MLP block 路径。 |
+| `nanoops/triton_fused_attn_qkv.py` | `fused_attn_qkv_projection`：residual/x0 mix、RMSNorm、独立 Q/K/V projection、rotary、Q/K norm+scale、可选 value embedding 和 backward。 | `NANOOPS_FUSED_ATTN=1` 的 attention input-side fusion。 |
+| `nanoops/triton_fused_attn_spda.py` | `(B, T, H, D)` 布局下支持 GQA 和 sliding-causal window 的 Flash-style SDPA forward/backward kernel。 | fused attention output op 内部使用的 SDPA engine。 |
+| `nanoops/triton_fused_attn_spda_and_output.py` | `fused_attn_spda_and_output`：SDPA 加 output projection/residual tail，以及对应 backward handoff。 | `NANOOPS_FUSED_ATTN=1` 的 attention output-side fusion。 |
+| `nanoops/train.sh` | 默认 d24 启动脚本。 | 在 2x 24 GiB GPU 上跑 full-fuse B=2 训练，配置 CPU optimizer offload 和 checkpoint cadence。 |
+| `nanoops/train_profile.sh` | Nsight Systems 短窗口 profiling wrapper。 | 抓 steady-state fused-kernel trace，避开 setup/eval 噪声。 |
+| `nanoops/README.md` / `README_zh.md` | 算子逐项说明、TODO、数学推导和教学解释。 | nanoops 主文档。 |
+| `nanoops/TRITON.md` / `TRITON_zh.md` | Triton kernel 设计指南和 RTX 3090 硬件预算。 | 解释硬件模型和 fusion trade-off。 |
+| `nanoops/TRITON_MLP.md` / `TRITON_MLP_zh.md` | fused MLP 设计笔记。 | 说明 MLP forward/backward 拆分和调参选择。 |
+| `nanoops/TRITON_QKV.md` / `TRITON_QKV_zh.md` | fused attention QKV-side 设计笔记。 | 说明 residual mix、RMSNorm、QKV projection、rotary/QK norm、VE 和 backward 数学。 |
+| `nanoops/TRITON_SPDA_OUTPUT.md` / `TRITON_SPDA_OUTPUT_zh.md` | fused SDPA/output 设计笔记。 | 说明 Flash-style SDPA、GQA/sliding-window、output projection、delta 和 backward。 |
+
 ### 实际效果
 
 **`--depth=24` 是 nanchat 的参考模型尺寸——3090 这种消费级显卡（RTX
