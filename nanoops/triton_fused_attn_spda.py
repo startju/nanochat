@@ -202,11 +202,7 @@ if _HAS_TRITON:
         offs_d = tl.arange(0, D)
 
         hid = kv_hid * GQA_GROUP + head_off
-        hm_mask = (
-            (offs_m < M)
-            & (kv_hid < H_KV)
-            & (hid < H_Q)
-        )
+        hm_mask = (offs_m < M) & (kv_hid < H_KV) & (hid < H_Q)
 
         q_ptrs = (
             Q
@@ -433,11 +429,7 @@ if _HAS_TRITON:
         batch_lse_base = bid * M * H_Q
 
         hid = kv_hid * GQA_GROUP + head_off
-        hm_mask = (
-            (offs_m < M)
-            & (kv_hid < H_KV)
-            & (hid < H_Q)
-        )
+        hm_mask = (offs_m < M) & (kv_hid < H_KV) & (hid < H_Q)
 
         q_ptrs = (
             Q
@@ -630,18 +622,10 @@ if _HAS_TRITON:
         batch_lse_base = bid * M * H_Q
 
         k_ptrs = (
-            K
-            + batch_k_base
-            + offs_n[:, None] * H_KV * D
-            + kv_hid * D
-            + offs_d[None, :]
+            K + batch_k_base + offs_n[:, None] * H_KV * D + kv_hid * D + offs_d[None, :]
         )
         v_ptrs = (
-            V
-            + batch_k_base
-            + offs_n[:, None] * H_KV * D
-            + kv_hid * D
-            + offs_d[None, :]
+            V + batch_k_base + offs_n[:, None] * H_KV * D + kv_hid * D + offs_d[None, :]
         )
         k_tile = tl.load(k_ptrs, mask=n_mask[:, None], other=0.0)
         v_tile = tl.load(v_ptrs, mask=n_mask[:, None], other=0.0)
@@ -669,11 +653,7 @@ if _HAS_TRITON:
 
         for q_idx in range(q_tile_start, full_q_tile_start):
             offs_m = q_idx * BLOCK_M + row_in_tile
-            hm_mask = (
-                (offs_m < M)
-                & (kv_hid < H_KV)
-                & (hid < H_Q)
-            )
+            hm_mask = (offs_m < M) & (kv_hid < H_KV) & (hid < H_Q)
 
             q_ptrs = (
                 Q
@@ -717,11 +697,7 @@ if _HAS_TRITON:
             dk_acc += tl.dot(tl.trans(ds).to(q.dtype), q)
         for q_idx in range(full_q_tile_start, full_q_tile_end):
             offs_m = q_idx * BLOCK_M + row_in_tile
-            hm_mask = (
-                (offs_m < M)
-                & (kv_hid < H_KV)
-                & (hid < H_Q)
-            )
+            hm_mask = (offs_m < M) & (kv_hid < H_KV) & (hid < H_Q)
 
             q_ptrs = (
                 Q
@@ -754,11 +730,7 @@ if _HAS_TRITON:
             dk_acc += tl.dot(tl.trans(ds).to(q.dtype), q)
         for q_idx in range(full_q_tile_end, q_tile_end):
             offs_m = q_idx * BLOCK_M + row_in_tile
-            hm_mask = (
-                (offs_m < M)
-                & (kv_hid < H_KV)
-                & (hid < H_Q)
-            )
+            hm_mask = (offs_m < M) & (kv_hid < H_KV) & (hid < H_Q)
 
             q_ptrs = (
                 Q
@@ -846,7 +818,9 @@ def _fused_attn_spda_fwd_impl(
     B_k, N, h_kv, D_k = k.shape
     assert v.shape == (B_k, N, h_kv, D_k)
     assert B == B_k and D == D_k, f"q{k.shape=} / {q.shape=} / {v.shape=}"
-    assert M == N, f"fused_attn_spda v1 requires same query/key length, got M={M}, N={N}"
+    assert M == N, (
+        f"fused_attn_spda v1 requires same query/key length, got M={M}, N={N}"
+    )
     assert h_q % h_kv == 0, f"H_q={h_q} must be divisible by H_kv={h_kv}"
     gqa_group = h_q // h_kv
     sm_scale = D**-0.5
@@ -913,7 +887,9 @@ def _fused_attn_spda_bwd_impl(
     assert h_q % h_kv == 0
     gqa_group = h_q // h_kv
     sm_scale = D**-0.5
-    dq_block_m, dq_block_n, dq_warps, dq_stages = _pick_fused_attn_spda_dq_tile_config(D)
+    dq_block_m, dq_block_n, dq_warps, dq_stages = _pick_fused_attn_spda_dq_tile_config(
+        D
+    )
     dkv_block_m, dkv_block_n, dkv_warps, dkv_stages = (
         _pick_fused_attn_spda_dkv_tile_config(D)
     )

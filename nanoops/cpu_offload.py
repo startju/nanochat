@@ -27,6 +27,8 @@ re-pin via the lazy alloc path.
 
 from __future__ import annotations
 
+from typing import Any
+
 import torch
 import torch.distributed as dist
 
@@ -36,12 +38,14 @@ import torch.distributed as dist
 from nanochat.optim import adamw_step_fused, muon_step_fused
 
 
-def _cpu_pinned_zeros(shape, dtype):
+def _cpu_pinned_zeros(
+    shape: torch.Size | tuple[int, ...], dtype: torch.dtype
+) -> torch.Tensor:
     """Optimizer state on the CPU side: zeros tensor pinned for async DMA."""
     return torch.zeros(shape, dtype=dtype, device="cpu", pin_memory=True)
 
 
-def migrate_optimizer_state_to_cpu_pinned(optimizer) -> None:
+def migrate_optimizer_state_to_cpu_pinned(optimizer: Any) -> None:
     """Walk `optimizer.state` and migrate every GPU-resident tensor back to
     CPU pinned memory. Call this ONCE immediately after
     `optimizer.load_state_dict(loaded_state)` when a checkpoint resume put
@@ -59,7 +63,14 @@ def migrate_optimizer_state_to_cpu_pinned(optimizer) -> None:
                 p_state[k] = v.detach().to("cpu", non_blocking=False).pin_memory()
 
 
-def patched_compute_adamw(self, group, info, gather_list, rank, world_size):
+def patched_compute_adamw(
+    self: Any,
+    group: dict[str, Any],
+    info: dict[str, Any],
+    gather_list: list[dict[str, Any]],
+    rank: int,
+    world_size: int,
+) -> None:
     """CPU-offloaded version of DistMuonAdamW._compute_adamw.
 
     State (exp_avg, exp_avg_sq) lives in pinned CPU memory; per optimizer
@@ -119,7 +130,13 @@ def patched_compute_adamw(self, group, info, gather_list, rank, world_size):
             gather_list.append(dict(future=future, params=None))
 
 
-def patched_compute_muon(self, group, info, gather_list, rank):
+def patched_compute_muon(
+    self: Any,
+    group: dict[str, Any],
+    info: dict[str, Any],
+    gather_list: list[dict[str, Any]],
+    rank: int,
+) -> None:
     """CPU-offloaded version of DistMuonAdamW._compute_muon.
 
     Muon state buffers (momentum_buffer, second_momentum_buffer) live on
@@ -202,7 +219,7 @@ def patched_compute_muon(self, group, info, gather_list, rank):
 # Same H2D/D2H pattern but without the reduce_scatter / all_gather glue.
 
 
-def patched_step_adamw(self, group):
+def patched_step_adamw(self: Any, group: dict[str, Any]) -> None:
     """CPU-offloaded version of MuonAdamW._step_adamw (single-GPU path)."""
     for p in group["params"]:
         if p.grad is None:
@@ -243,7 +260,7 @@ def patched_step_adamw(self, group):
         state["exp_avg_sq"].copy_(exp_avg_sq_g, non_blocking=True)
 
 
-def patched_step_muon(self, group):
+def patched_step_muon(self: Any, group: dict[str, Any]) -> None:
     """CPU-offloaded version of MuonAdamW._step_muon (single-GPU path)."""
     params = group["params"]
     if not params:

@@ -87,6 +87,7 @@ _QKV_BWD_WEIGHT_GRAD_NUM_STAGES = 2
 
 
 if _HAS_TRITON:
+
     @triton.jit
     def _fused_attn_qkv_projection_norm_fwd_kernel(
         x_ptr,  # (M, K), dtype=x.dtype — in: previous layer residual stream
@@ -200,7 +201,9 @@ if _HAS_TRITON:
                 w_ptrs = k_w_ptr + weight_rows[:, None] * K + ks[None, :]
             else:
                 w_ptrs = v_w_ptr + weight_rows[:, None] * K + ks[None, :]
-            w = tl.load(w_ptrs, mask=k_mask[None, :], other=0.0).to(x_ptr.dtype.element_ty)
+            w = tl.load(w_ptrs, mask=k_mask[None, :], other=0.0).to(
+                x_ptr.dtype.element_ty
+            )
             acc += tl.dot(x, tl.trans(w))
 
         if is_v:
@@ -233,12 +236,7 @@ if _HAS_TRITON:
                     other=0.0,
                 )
                 v_out += gate[:, None] * ve
-            v_ptrs = (
-                v_ptr
-                + rows[:, None] * n_kv_head * D
-                + head * D
-                + cols[None, :]
-            )
+            v_ptrs = v_ptr + rows[:, None] * n_kv_head * D + head * D + cols[None, :]
             tl.store(
                 v_ptrs,
                 v_out,
@@ -246,7 +244,9 @@ if _HAS_TRITON:
             )
             return
 
-        acc_halves = tl.reshape(acc.to(x_ptr.dtype.element_ty), (BLOCK_M, 2, BLOCK_D // 2))
+        acc_halves = tl.reshape(
+            acc.to(x_ptr.dtype.element_ty), (BLOCK_M, 2, BLOCK_D // 2)
+        )
         acc_lo, acc_hi = tl.split(tl.trans(acc_halves, 0, 2, 1))
         rotary_rows = rows % rotary_seq_len
 
@@ -271,12 +271,7 @@ if _HAS_TRITON:
         qk = qk * norm_scale[:, None]
 
         if is_q:
-            q_ptrs = (
-                q_ptr
-                + rows[:, None] * n_head * D
-                + head * D
-                + cols[None, :]
-            )
+            q_ptrs = q_ptr + rows[:, None] * n_head * D + head * D + cols[None, :]
             tl.store(
                 qk_rms_inv_ptr + rows * (n_head + n_kv_head) + head,
                 qk_rms_inv,
@@ -284,12 +279,7 @@ if _HAS_TRITON:
             )
             tl.store(q_ptrs, qk.to(q_ptr.dtype.element_ty), mask=row_mask[:, None])
         else:
-            k_ptrs = (
-                k_ptr
-                + rows[:, None] * n_kv_head * D
-                + head * D
-                + cols[None, :]
-            )
+            k_ptrs = k_ptr + rows[:, None] * n_kv_head * D + head * D + cols[None, :]
             tl.store(
                 qk_rms_inv_ptr + rows * (n_head + n_kv_head) + n_head + head,
                 qk_rms_inv,
@@ -400,10 +390,7 @@ if _HAS_TRITON:
                 other=0.0,
             )
             d_v = tl.load(
-                d_v_ptr
-                + rows[:, None] * N_KV_HEAD * D
-                + head * D
-                + cols[None, :],
+                d_v_ptr + rows[:, None] * N_KV_HEAD * D + head * D + cols[None, :],
                 mask=row_mask[:, None],
                 other=0.0,
             )
@@ -483,9 +470,9 @@ if _HAS_TRITON:
                 other=0.0,
             )
             qk_inner = tl.sum(g * y0, axis=1, dtype=tl.float32) / D
-            d_rot = (
-                qk_rms_inv[:, None] * (g - y0 * qk_inner[:, None])
-            ).to(d_q_pre_ptr.dtype.element_ty)
+            d_rot = (qk_rms_inv[:, None] * (g - y0 * qk_inner[:, None])).to(
+                d_q_pre_ptr.dtype.element_ty
+            )
             d_rot_halves = tl.reshape(d_rot, (BLOCK_M, 2, BLOCK_D // 2))
             d_rot_lo, d_rot_hi = tl.split(tl.trans(d_rot_halves, 0, 2, 1))
 
@@ -507,10 +494,7 @@ if _HAS_TRITON:
 
             if is_q:
                 pre_ptrs = (
-                    d_q_pre_ptr
-                    + rows[:, None] * N_HEAD * D
-                    + head * D
-                    + cols[None, :]
+                    d_q_pre_ptr + rows[:, None] * N_HEAD * D + head * D + cols[None, :]
                 )
             else:
                 pre_ptrs = (
@@ -775,9 +759,9 @@ if _HAS_TRITON:
             mask=mask,
             other=0.0,
         )
-        dx_mix = (x_rms_inv[:, None] * (
-            dx_hat - x_norm * outer_rms_row_inner[:, None]
-        )).to(dx_hat.dtype)
+        dx_mix = (
+            x_rms_inv[:, None] * (dx_hat - x_norm * outer_rms_row_inner[:, None])
+        ).to(dx_hat.dtype)
         grad_x_mix = tl.load(grad_x_mix_ptr + offs, mask=mask, other=0.0)
         dx_mix += grad_x_mix
 
@@ -815,6 +799,7 @@ if _HAS_TRITON:
             sem="relaxed",
         )
 
+
 def _validate_rotary_table_4d(
     table: torch.Tensor,
     T: int,
@@ -823,9 +808,7 @@ def _validate_rotary_table_4d(
     """Validate a 4D broadcast rotary table."""
     half = head_dim // 2
     assert table.is_cuda and table.is_contiguous()
-    assert table.ndim == 4, (
-        f"rotary table must be 4D (1, T, 1, D/2), got {table.ndim}D"
-    )
+    assert table.ndim == 4, f"rotary table must be 4D (1, T, 1, D/2), got {table.ndim}D"
     assert table.shape[0] == 1 and table.shape[2] == 1
     assert T > 0
     assert table.shape[1] == T, (
@@ -1091,7 +1074,9 @@ def _fused_attn_qkv_projection_bwd_impl(
         ve_ids is not None or ve_weight is not None or ve_gate_weight is not None
     )
     if has_value_embedding:
-        assert ve_ids is not None and ve_weight is not None and ve_gate_weight is not None
+        assert (
+            ve_ids is not None and ve_weight is not None and ve_gate_weight is not None
+        )
         assert ve_ids.is_cuda and ve_weight.is_cuda and ve_gate_weight.is_cuda
         assert ve_weight.is_contiguous() and ve_gate_weight.is_contiguous()
         assert ve_ids.numel() == M
@@ -1115,7 +1100,9 @@ def _fused_attn_qkv_projection_bwd_impl(
     ve_gate_block = triton.next_power_of_2(ve_gate_channels)
 
     if has_value_embedding:
-        assert ve_ids is not None and ve_weight is not None and ve_gate_weight is not None
+        assert (
+            ve_ids is not None and ve_weight is not None and ve_gate_weight is not None
+        )
         ve_ids_for_kernel = ve_ids.reshape(M).contiguous()
         ve_weight_for_kernel = ve_weight
         ve_gate_weight_for_kernel = ve_gate_weight
@@ -1373,7 +1360,9 @@ def _fused_attn_qkv_projection_fwd_impl(
     internal `(M, *)` outputs: q/k/v, x_mix, rms_inv, qk_rms_inv.
     """
     if not _HAS_TRITON:
-        raise RuntimeError("fused_attn_qkv_projection residual-mix path requires triton")
+        raise RuntimeError(
+            "fused_attn_qkv_projection residual-mix path requires triton"
+        )
     assert x.is_cuda and x.ndim == 3 and x.is_contiguous()
     assert x0.is_cuda and x0.shape == x.shape and x0.is_contiguous()
     assert resid_scale.is_cuda and x0_scale.is_cuda
@@ -1421,7 +1410,9 @@ def _fused_attn_qkv_projection_fwd_impl(
     x_mix = torch.empty_like(x_2d)
     x_hat = torch.empty_like(x_2d)
     rms_inv = torch.empty((M,), dtype=torch.float32, device=x.device)
-    wrap_triton(_fused_attn_qkv_projection_norm_fwd_kernel)[(triton.cdiv(M, norm_cfg.block_m),)](
+    wrap_triton(_fused_attn_qkv_projection_norm_fwd_kernel)[
+        (triton.cdiv(M, norm_cfg.block_m),)
+    ](
         x_2d,
         x0_2d,
         resid_scale,
@@ -1440,7 +1431,9 @@ def _fused_attn_qkv_projection_fwd_impl(
     q = torch.empty((M, n_head, head_dim), dtype=x_hat.dtype, device=x_hat.device)
     k = torch.empty((M, n_kv_head, head_dim), dtype=x_hat.dtype, device=x_hat.device)
     v = torch.empty((M, n_kv_head, head_dim), dtype=x_hat.dtype, device=x_hat.device)
-    qk_rms_inv = torch.empty((M, n_head + n_kv_head), dtype=torch.float32, device=x.device)
+    qk_rms_inv = torch.empty(
+        (M, n_head + n_kv_head), dtype=torch.float32, device=x.device
+    )
     if has_value_embedding:
         qkv_block_m = _QKV_FWD_VE_BLOCK_M
         qkv_block_k = _QKV_FWD_VE_BLOCK_K

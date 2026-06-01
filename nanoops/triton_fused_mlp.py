@@ -104,6 +104,7 @@ _MLP_BWD_DX_BF16_NUM_STAGES = 2
 
 
 if _HAS_TRITON:
+
     @triton.jit
     def _fused_mlp_rms_norm_fwd_kernel(
         x_ptr,  # (M, K), activation dtype — in
@@ -885,9 +886,7 @@ def _fused_mlp_autograd_backward(
     # grad_rms_inv / grad_z are zeros: rms_inv and z exist only to
     # plumb fwd→bwd state inside this op, no downstream consumer.
     W_fc, W_proj, x, rms_inv, z = ctx.saved_tensors
-    dx, dW_fc, dW_proj = _fused_mlp_bwd_op(
-        grad_y, x, W_fc, W_proj, rms_inv, z
-    )
+    dx, dW_fc, dW_proj = _fused_mlp_bwd_op(grad_y, x, W_fc, W_proj, rms_inv, z)
     return dx, dW_fc, dW_proj, None
 
 
@@ -940,7 +939,5 @@ def fused_mlp(
     # triton_op returns internal-M-view (y, rms_inv, z); rms_inv/z are
     # saved-for-backward only, so we drop them here and return just y in the
     # public `(B, T, K)` view.
-    y, _rms_inv, _z = _fused_mlp_fwd_op(
-        x_2d, fc_weight, proj_weight, eps
-    )
+    y, _rms_inv, _z = _fused_mlp_fwd_op(x_2d, fc_weight, proj_weight, eps)
     return y.view(B, T, K)

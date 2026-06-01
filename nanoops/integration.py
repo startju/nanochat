@@ -133,9 +133,9 @@ def _patched_block_forward(self, x, ve, cos_sin, window_size, kv_cache):
 
     Patched: attn side unchanged; the second line collapses
     `norm + c_fc + relu² + c_proj + outer-residual-add` into one fused
-    call (3 Triton kernels fwd + 4 Triton kernels bwd, see TRITON_zh.md
-    §3). The public fused call keeps `(B,T,C)`; its wrapper flattens to
-    `M=B*T` before launching Triton kernels.
+    call (3 Triton kernels fwd + 4 Triton kernels bwd, see
+    nanoops/TRITON_MLP_zh.md). The public fused call keeps `(B,T,C)`;
+    its wrapper flattens to `M=B*T` before launching Triton kernels.
 
     nanochat's `norm()` is `F.rms_norm(x, (x.size(-1),))` — plain
     RMSNorm without per-channel affine (see gpt.py:42), so the fused op
@@ -280,9 +280,7 @@ def _patched_gpt_forward(self, idx, targets=None, kv_cache=None, loss_reduction=
         resid_scale = self.resid_lambdas[i]
         x0_scale = self.x0_lambdas[i]
         ve_weight = (
-            self.value_embeds[str(i)].weight
-            if str(i) in self.value_embeds
-            else None
+            self.value_embeds[str(i)].weight if str(i) in self.value_embeds else None
         )
         is_full_attn = self.window_sizes[i][0] < 0 or self.window_sizes[i][0] >= T
         if os.environ.get("NANOOPS_L_ATTN_CHECKPOINT") and is_full_attn:
@@ -443,7 +441,7 @@ def _apply() -> dict[str, dict]:
     # `fused_mlp(x, W_fc, W_proj)` call that collapses
     # norm + c_fc + relu² + c_proj + outer residual into 3 fwd Triton
     # kernels + 4 bwd Triton kernels.
-    # See nanoops/TRITON_zh.md §3 for the fusion breakdown. Supersedes
+    # See nanoops/TRITON_MLP_zh.md for the fusion breakdown. Supersedes
     # the relu_square fusion (which is a subset of what's fused here).
     if os.environ.get("NANOOPS_FUSED_MLP"):
         from .triton_fused_mlp import fused_mlp as _fmb
@@ -460,7 +458,9 @@ def _apply() -> dict[str, dict]:
     # the fused op owns the outer RMSNorm that nanchat applies one level up in
     # Block.forward, and it needs token ids + VE table to fuse value embedding.
     if os.environ.get("NANOOPS_FUSED_ATTN"):
-        from .triton_fused_attn_spda_and_output import fused_attn_spda_and_output as _tail
+        from .triton_fused_attn_spda_and_output import (
+            fused_attn_spda_and_output as _tail,
+        )
         from .triton_fused_attn_qkv import fused_attn_qkv_projection as _nqp
 
         assert _orig_gpt_forward is None, (
@@ -556,7 +556,9 @@ def patch_nanchat() -> list[str]:
     if os.environ.get("NANOOPS_FUSED_MLP"):
         names.append("Block.forward(fused_mlp — supersedes relu_square fusion)")
     if os.environ.get("NANOOPS_FUSED_ATTN"):
-        names.append("GPT.forward(fused_attn_qkv_projection + fused_attn_spda_and_output fused)")
+        names.append(
+            "GPT.forward(fused_attn_qkv_projection + fused_attn_spda_and_output fused)"
+        )
     return names
 
 

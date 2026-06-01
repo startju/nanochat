@@ -89,7 +89,9 @@ class TileConfig(NamedTuple):
         return self.est_regs_per_thread <= 256
 
 
-def _pick_fused_add_norm_tile_config(M: int, BLOCK_D: int, n_live_tiles: int) -> TileConfig:
+def _pick_fused_add_norm_tile_config(
+    M: int, BLOCK_D: int, n_live_tiles: int
+) -> TileConfig:
     """Pick (BLOCK_M, num_warps) for a (BLOCK_M × BLOCK_D)-tiled kernel.
 
     Register-budget model (Ampere, 255 fp32 regs/thread spill cap):
@@ -614,7 +616,9 @@ def _fused_add_norm_bwd_impl(
     # the 2-kernel D-split path which uses a much smaller fixed tile.
     BLOCK_D = triton.next_power_of_2(D)
     inline_n_live = 5 if has_nw else 4
-    inline_cfg = _pick_fused_add_norm_tile_config(M, BLOCK_D, n_live_tiles=inline_n_live)
+    inline_cfg = _pick_fused_add_norm_tile_config(
+        M, BLOCK_D, n_live_tiles=inline_n_live
+    )
     use_inline = inline_cfg.fits_reg_budget
 
     if use_inline:

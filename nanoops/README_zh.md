@@ -71,19 +71,40 @@ Tier 2 加入注意力；Tier 3 是可选的性能优化版本。
 
 ### Tier 3 —— 用 Triton 写的融合 kernel（可选）
 
-- [x] **`norm_mlp_relu_square`**：`relu(RMSNorm(x) @ W_fc.T)² @ W_proj.T` ——
-      整个 MLP 块。Forward 在一个 tiled Triton kernel 里同时做 RMSNorm +
-      c_fc + ReluSquare（per-row rms 在寄存器里跨 matmul 复用）；c_proj 走
-      cuBLAS。Backward 串联两次 cuBLAS 梯度 + 一个小的 relu²-bwd Triton
-      kernel + 一个 RMSNorm-bwd Triton kernel。
-- [x] **`fused_attn_qkv_projection`**：`RMSNorm(x) @ W_qkv.T`，其中 W_qkv 是把
-      `c_q.weight, c_k.weight, c_v.weight` 在 dim 0 上拼接得到，并在写回前
-      对 Q/K 做 rotary、QK RMSNorm 和 scale。它覆盖 SDPA 之前的 QKV-side
-      setup。
+- [x] **`fused_mlp`**：完整 MLP side，
+      `x + relu²(RMSNorm(x) @ W_fc.T) @ W_proj.T`，fwd/bwd 都是 Triton
+      kernel。见 [TRITON_MLP_zh.md](TRITON_MLP_zh.md)。
+- [x] **`fused_attn_qkv_projection`**：residual/x0 blend、无 affine
+      RMSNorm、分开的 Q/K/V projection、Q/K rotary + QK RMSNorm + scale，
+      以及可选 gated value embedding。见 [TRITON_QKV_zh.md](TRITON_QKV_zh.md)。
+- [x] **`fused_attn_spda_and_output`**：Flash-style sliding/full causal
+      GQA SDPA + output projection/residual，output-projection backward
+      直接产出 SDPA 需要的 `delta` buffer。见
+      [TRITON_SPDA_OUTPUT_zh.md](TRITON_SPDA_OUTPUT_zh.md)。
 
 block 级 fused kernel 覆盖 transformer block 里最重的 "norm + linear 链"
 入口；旧的 Triton fused CE tail 已删除，集成 patch 开启时
 lm-head / softcap / cross entropy tail 仍优先使用 nanoops functional 算子。
+
+### 训练集成开关
+
+`nanoops.integration` 分两层：
+
+- `NANOOPS=1` 把 nanochat 里的 PyTorch functional call patch 到教学版
+  `nanoops.functional` 实现（`linear`、`embedding`、`rms_norm`、`softmax`、
+  `cross_entropy`、`scaled_dot_product_attention`、`sigmoid`、`tanh`、
+  rotary 等）。
+- `NANOOPS_FUSED_MLP=1` 把 MLP side 换成 `fused_mlp`。
+- `NANOOPS_FUSED_ATTN=1` 把训练 attention path 换成
+  `fused_attn_qkv_projection + fused_attn_spda_and_output`。
+
+`bash nanoops/train.sh` 默认走 full-fuse 性能路径：fused MLP + fused QKV +
+fused SDPA/output，`device-batch-size=2`，并关闭 MLP 和 L-attention
+activation checkpoint。当前 2× RTX 3090 上 d24 compile/warmup 后的稳态实测
+约为 53.8 s/step、19.5k tok/s、65.6% MFU。设置
+`NANOOPS_FUSED=0 bash nanoops/train.sh` 可以切回 checkpoint-heavy 的显存优先
+d24 配方，给 24 GiB 卡留更多余量。loss tail 不再有 Triton CE kernel；这里
+刻意使用标准 nanoops functional 的 `linear` / `tanh` / `cross_entropy` 路径。
 
 ### 新增算子流程
 
@@ -725,7 +746,9 @@ $$
 $O(B \cdot H \cdot L \cdot S)$，self-attention 时就是 $O(B \cdot H \cdot L^2)$。
 FlashAttention 优化的就是这一项：只存每行的归一化 stats（log-sum-exp 和 max，
 都是 $O(B \cdot H \cdot L)$），backward 一块一块地重算 $P$，ctx 直接降一个
-$S$ 量级。nanoops Tier 3 计划用 Triton 写这版（见 TODO）。
+$S$ 量级。这个教学版 `ScaledDotProductAttention` 刻意保持朴素；生产 Triton
+路径已经在 `triton_fused_attn_spda.py` 里实现 Flash-style 版本，见
+[TRITON_SPDA_OUTPUT_zh.md](TRITON_SPDA_OUTPUT_zh.md)。
 
 **GQA (Grouped Query Attention).** 当 `enable_gqa=True` 且 $H_q > H_{kv}$ 时，
 forward 沿 heads 维度用 `repeat_interleave` 把 $K, V$ expand 出 $G = H_q / H_{kv}$ 倍。

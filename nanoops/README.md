@@ -79,21 +79,43 @@ adds optional fast-path variants.
 
 ### Tier 3 — fused Triton kernels (optional)
 
-- [x] **`norm_mlp_relu_square`**: `relu(RMSNorm(x) @ W_fc.T)² @ W_proj.T` —
-      the full MLP block. Forward fuses RMSNorm + c_fc + ReluSquare into
-      a single tiled Triton kernel (per-row rms cached in registers
-      across the matmul); c_proj uses cuBLAS. Backward chains the two
-      cuBLAS gradients with a small relu²-bwd Triton kernel and an
-      RMSNorm-bwd Triton kernel.
-- [x] **`fused_attn_qkv_projection`**: `RMSNorm(x) @ W_qkv.T` where W_qkv is
-      `concat([c_q.weight, c_k.weight, c_v.weight])`, with Q/K rotary,
-      QK RMSNorm, and scale applied before writeback. This covers the
-      QKV-side setup before SDPA.
+- [x] **`fused_mlp`**: full MLP side,
+      `x + relu²(RMSNorm(x) @ W_fc.T) @ W_proj.T`, implemented as
+      all-Triton fwd/bwd kernels. See [TRITON_MLP.md](TRITON_MLP.md).
+- [x] **`fused_attn_qkv_projection`**: residual/x0 blend, no-affine
+      RMSNorm, separate Q/K/V projections, Q/K rotary + QK RMSNorm +
+      scale, and optional gated value embedding. See
+      [TRITON_QKV.md](TRITON_QKV.md).
+- [x] **`fused_attn_spda_and_output`**: Flash-style sliding/full causal
+      GQA SDPA plus output projection/residual, with output-projection
+      backward producing the SDPA `delta` buffer directly. See
+      [TRITON_SPDA_OUTPUT.md](TRITON_SPDA_OUTPUT.md).
 
 The block-level fused kernels cover the heaviest "norm + linear chain" entries
 of the transformer block; the old Triton fused CE tail is removed, while the
 standard nanoops functional ops still cover the lm-head/softcap/CE path when
 integration patching is enabled.
+
+### Training integration knobs
+
+`nanoops.integration` has two layers:
+
+- `NANOOPS=1` patches nanochat's PyTorch functional calls to the teaching
+  `nanoops.functional` implementations (`linear`, `embedding`, `rms_norm`,
+  `softmax`, `cross_entropy`, `scaled_dot_product_attention`, `sigmoid`,
+  `tanh`, rotary, etc.).
+- `NANOOPS_FUSED_MLP=1` replaces the MLP side with `fused_mlp`.
+- `NANOOPS_FUSED_ATTN=1` replaces the training attention path with
+  `fused_attn_qkv_projection + fused_attn_spda_and_output`.
+
+`bash nanoops/train.sh` uses the full-fuse performance path by default:
+fused MLP + fused QKV + fused SDPA/output, with `device-batch-size=2` and MLP
+and L-attention activation checkpointing disabled. On 2× RTX 3090, the current
+d24 steady-state measurement after compile/warmup is about 53.8 s/step, 19.5k
+tok/s, and 65.6% MFU. Set `NANOOPS_FUSED=0 bash nanoops/train.sh` to use the
+checkpoint-heavy memory-first d24 recipe for tighter 24 GiB headroom. The loss
+tail no longer has a Triton CE kernel; it intentionally uses the standard
+nanoops functional `linear` / `tanh` / `cross_entropy` path.
 
 ### Conventions for each new op
 
@@ -794,8 +816,10 @@ $(B, H, L, S)$ — that's the **naive** memory strategy: $O(B \cdot H \cdot L \c
 or $O(B \cdot H \cdot L^2)$ for self-attention. This is what FlashAttention
 optimizes away: by saving only the per-row normalization stats (log-sum-exp and
 max, each $O(B \cdot H \cdot L)$) and recomputing $P$ tile-by-tile in backward,
-ctx memory drops by a factor of $S$. nanoops's Tier 3 plan is to implement that
-version in Triton (see TODO).
+ctx memory drops by a factor of $S$. This teaching `ScaledDotProductAttention`
+class intentionally stays naive; the production Triton path implements the
+Flash-style version in `triton_fused_attn_spda.py` (see
+[TRITON_SPDA_OUTPUT.md](TRITON_SPDA_OUTPUT.md)).
 
 **GQA (Grouped Query Attention).** When `enable_gqa=True` and $H_q > H_{kv}$,
 forward expands $K, V$ along the heads dim by a factor $G = H_q / H_{kv}$ using

@@ -51,21 +51,15 @@ with two intertwined goals:
    not just on a whiteboard.
 
 2. **Optimize nanchat training on a 24 GiB GPU along two axes: speed
-   AND model size.** nanchat targets H100 with FA3; on the 3090 the
-   SDPA dispatcher falls back to a slow path on sliding-window
-   attention. nanoops's hand-written ops sidestep this (the *speed*
-   axis — d20 base-train goes from 22.7k to ~30.5k tok/s, +34%
-   throughput). A Python-level `SlidingWindowSDPA` that chunks the
-   per-layer attention band cuts peak P-matrix memory by ~4×, MLP
-   activation checkpoint frees another ~3.7 GiB, and an **optimizer-
-   state CPU offload** moves the Muon + AdamW state (~3 GiB on d24
-   under ZeRO-1, full size on single-GPU) into pinned host memory —
-   together these unlock the *size* axis: `--depth=24`, nanchat's
-   reference ~1.5 B-param configuration that normally OOMs at every
-   batch size on a 24 GiB card, now fits at `--device-batch-size=1`
-   on either one or two 3090s. So consumer hardware can train both
-   **faster** (smaller configs) and **larger models that wouldn't fit
-   at all** (bigger configs).
+   AND model size.** nanoops now has two execution layers. The teaching
+   layer is the Python `autograd.Function` rewrite above. The training
+   layer is a Triton full-fuse path for the hot transformer block pieces:
+   `fused_mlp`, `fused_attn_qkv_projection`, and
+   `fused_attn_spda_and_output`. The old Triton fused CE tail was removed;
+   lm-head / softcap / CE stay on the standard nanoops functional path.
+   Together with optimizer-state CPU offload and the expandable-segments
+   allocator, the fused path lets consumer 24 GiB GPUs run d24 while also
+   improving the compiled training step.
 
 ### What this means in practice
 
@@ -78,21 +72,24 @@ OOMs at every batch size: 1.5 B parameters auto-widened to
 fit. The reference hardware is an 8× H100 node — well out of reach for
 anyone learning at home or on a small budget.
 
-This fork's full optimization stack — SlidingWindowSDPA (chunked
-attention keeps the band only, no full P) + MLP activation checkpoint
-+ optimizer state CPU offload + the `expandable_segments` allocator
-— frees enough peak GPU memory and tames allocator fragmentation
-enough that d24 actually fits at `--device-batch-size=1` on a 24 GiB
-consumer card, whether you have **one** or **two** of them. The
-2-GPU run finishes in about half the wall time of the 1-GPU run (DDP
-data-parallel, so it's just more tokens/sec at the same per-iter peak
-memory). **The point is to put nanchat's default training within
-reach of a beginner's hardware budget.**
+This fork's memory stack — banded/sliding attention, optional activation
+checkpointing, optimizer-state CPU offload, and the
+`expandable_segments` allocator — frees enough peak GPU memory and
+tames allocator fragmentation enough that d24 actually fits at
+`--device-batch-size=1` on a 24 GiB consumer card, whether you have
+**one** or **two** of them. The full-fuse Triton path then attacks the
+training step itself and defaults to `--device-batch-size=2` on dual
+3090s: fused MLP, fused QKV/rotary/QK-norm/VE, and fused
+SDPA/output-projection handoff. The 2-GPU run still finishes in about
+half the wall time of the 1-GPU run (DDP data-parallel, so it's just
+more tokens/sec at the same per-iter peak memory). **The point is to
+put nanchat's default training within reach of a beginner's hardware
+budget.**
 
 | Config            | nanchat default | nanoops, 1× 24 GiB GPU | nanoops, 2× 24 GiB GPUs |
 | ----------------- | --------------- | ---------------------- | ----------------------- |
 | `--depth=20`, B=4 | OOM (no FA3)    | (recipe applies)       | **~30.5k tok/s**, ~31 h |
-| `--depth=24`, B=1 | OOM at all B    | **~8k tok/s**, ~200 h  | **~16k tok/s**, ~101 h  |
+| `--depth=24`, B=1/2 | OOM at all B | **~8k tok/s**, ~200 h  | **~16k tok/s** checkpoint-heavy B=1; **~19.5k tok/s** full-fuse B=2 |
 
 **Concretely:** at typical spot-rental rates of ~$0.18/GPU/hr for an
 RTX 3090, a single 3090 costs ~$0.18/hr (~$30/week) and a 2× 3090 rig
@@ -127,30 +124,61 @@ Loss curves match across all rows to within bf16 rounding noise.
 Full A/B autopsy lives in the
 [`SlidingWindowSDPA` docstring](nanoops/functional.py).
 
+Current d24 full-fuse path (`NANOOPS_FUSED=1`, 2× RTX 3090, B=2, after
+compile/eval warmup) is about **53.8 s/step**, **19.5k tok/s**, and
+**~65.6% MFU**. Use `NANOOPS_FUSED=0` when memory headroom matters more
+than step time.
+
+### What `NANOOPS_FUSED=1` covers
+
+The default fused path is not just a faster `F.linear` swap. It replaces the
+hot transformer-block chains with compile-visible Triton custom ops:
+
+- `fused_mlp`: pre-RMSNorm, `c_fc`, ReLU², `c_proj`, residual add, and the
+  matching backward path.
+- `fused_attn_qkv_projection`: residual/x0 mixing, RMSNorm, separate Q/K/V
+  projections, rotary, Q/K RMSNorm+scale, optional value embedding gate/lookup,
+  and the matching backward path.
+- `fused_attn_spda_and_output`: GQA/sliding-window SDPA plus the attention
+  output projection/residual tail, including the backward delta/output-proj
+  work that used to be separate.
+- `fused_add_norm`: standalone add+RMSNorm Triton op, also reused by the block
+  fused kernels.
+
+The lm-head / softcap / cross-entropy tail intentionally stays on the standard
+nanoops functional path; the experimental Triton CE tail was removed because it
+saved memory but lost too much throughput versus the native GEMM-heavy path.
+
 ### Try it
 
 ```bash
 # Drop-in replacement for speedrun.sh's base_train step. Defaults to
-# --depth=24 --device-batch-size=1 (the biggest nanchat config that
-# fits on a 24 GiB consumer card). Five optimizations active by default:
-# sliding-window SDPA + chunked full attention + MLP activation
-# checkpoint + optimizer state CPU offload + expandable_segments
-# allocator.
-bash nanoops/train.sh                       # uses both visible GPUs
+# --depth=24. The default path is full-fuse with device-batch-size=2:
+# fused MLP + fused QKV + fused SDPA/output, no activation checkpoints,
+# optimizer state offloaded to CPU, and expandable_segments set before CUDA init.
+bash nanoops/train.sh                       # full-fuse, uses both visible GPUs
 NPROC=1 bash nanoops/train.sh               # single GPU — same recipe still fits
+NANOOPS_FUSED=0 bash nanoops/train.sh       # memory-first checkpoint-heavy path
 
 # Or override defaults — e.g. fastest throughput on dual 3090:
 bash nanoops/train.sh --depth=20 --device-batch-size=4
 
-# Active env vars (set automatically by train.sh):
+# Effective defaults / env vars:
 #   NANOOPS=1                                       activates the integration
 #   PYTORCH_ALLOC_CONF=expandable_segments:True     recovers fragmentation
-#   NANOOPS_MLP_CHECKPOINT=1                        ~3.7 GiB peak savings
 #   NANOOPS_OFFLOAD_OPTIM=1                         Muon+AdamW state on CPU;
 #                                                    needed to fit d24+B=1
+#   NANOOPS_FUSED_MLP=1                             fused Triton MLP block
+#   NANOOPS_FUSED_ATTN=1                            fused QKV + SDPA/output
+#   NANOOPS_DEVICE_BATCH_SIZE=2                     full-fuse default micro-batch
+#   NANOOPS_SAVE_EVERY=200                          checkpoint cadence
 #
-# Opt-in experimental knobs:
-#   NANOOPS_LOOKUP_SORTED=1       try the segmented-sum embedding backward
+# Mode knobs:
+#   NANOOPS_FUSED=1                                  default: full-fuse speed path
+#   NANOOPS_FUSED=0                                  memory-first checkpoint path
+#   NANOOPS_MLP_CHECKPOINT=1                         memory-first MLP ckpt
+#   NANOOPS_L_ATTN_CHECKPOINT=1                      memory-first L-attn ckpt
+#   NANOOPS_LOOKUP_SORTED=1                          segmented embedding bwd
 ```
 
 See [`nanoops/README.md`](nanoops/README.md) for the op-by-op TODO list +

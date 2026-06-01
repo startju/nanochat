@@ -7,7 +7,7 @@
 #
 # Usage:
 #   bash nanoops/train.sh                       # defaults below
-#   NANOOPS_FUSED=1 bash nanoops/train.sh       # full fuse, no activation checkpoints
+#   NANOOPS_FUSED=0 bash nanoops/train.sh       # memory-first path with activation checkpoints
 #   bash nanoops/train.sh --num-iterations=10   # pass extra args through
 #   NPROC=4 bash nanoops/train.sh               # override GPU count
 #   WANDB_RUN=myrun bash nanoops/train.sh       # enable wandb logging
@@ -26,7 +26,9 @@ export NANOCHAT_BASE_DIR="${NANOCHAT_BASE_DIR:-$HOME/.cache/nanochat}"
 # scripts/base_train.py (line 15) before any CUDA call, so we don't
 # re-export it here.
 
-NANOOPS_FUSED=${NANOOPS_FUSED:-}
+# Full-fuse ON by default. Set NANOOPS_FUSED=0 (or empty) to use the
+# checkpoint-heavy memory-first path.
+export NANOOPS_FUSED="${NANOOPS_FUSED-1}"
 
 # Optimizer CPU offload ON by default — moves DistMuonAdamW's per-rank
 # Muon + AdamW state (~2.5 GB + ~300 MB on d24 under ZeRO-1) to CPU
@@ -37,21 +39,22 @@ NANOOPS_FUSED=${NANOOPS_FUSED:-}
 # pattern). Opt out with empty value.
 export NANOOPS_OFFLOAD_OPTIM="${NANOOPS_OFFLOAD_OPTIM:-1}"
 
-if [ -n "$NANOOPS_FUSED" ]; then
-    # Full-fuse d24 path for performance runs: use fused MLP + fused QKV
+if [ -n "$NANOOPS_FUSED" ] && [ "$NANOOPS_FUSED" != "0" ]; then
+    # Full-fuse d24 path: use fused MLP + fused QKV
     # + fused SDPA/output tail, but do not activation-checkpoint MLP or
     # full-attention layers. The old Triton fused CE tail is removed; the
     # standard nanoops functional ops remain the first choice for the loss tail.
     #
-    # Current d24 + B=1 + 2x RTX 3090 run, after compile/eval warmup:
-    #   dt        ~55.8 s/step
-    #   tok/sec   ~18,800
-    #   MFU       ~63%
-    # First step is slower (~125 s) because it includes validation and compile.
+    # Current d24 + B=2 + 2x RTX 3090 run, after compile/eval warmup:
+    #   dt        ~53.8 s/step
+    #   tok/sec   ~19,500
+    #   MFU       ~65.6%
+    # The first emitted step is slower because it includes resume/compile work.
     export NANOOPS_MLP_CHECKPOINT=
     export NANOOPS_L_ATTN_CHECKPOINT=
     export NANOOPS_FUSED_MLP=1
     export NANOOPS_FUSED_ATTN=1
+    DEVICE_BATCH_SIZE="${NANOOPS_DEVICE_BATCH_SIZE:-2}"
 else
     # Checkpoint-heavy d24 path. This keeps the historical defaults:
     # fused kernels are enabled, and activation checkpointing is on to
@@ -60,6 +63,7 @@ else
     export NANOOPS_L_ATTN_CHECKPOINT="${NANOOPS_L_ATTN_CHECKPOINT:-1}"
     export NANOOPS_FUSED_MLP="${NANOOPS_FUSED_MLP:-1}"
     export NANOOPS_FUSED_ATTN="${NANOOPS_FUSED_ATTN-1}"
+    DEVICE_BATCH_SIZE="${NANOOPS_DEVICE_BATCH_SIZE:-1}"
 fi
 SAVE_EVERY=${NANOOPS_SAVE_EVERY:-200}
 
@@ -69,7 +73,7 @@ WANDB_RUN=${WANDB_RUN:-dummy}
 BASE_TRAIN_ARGS=(
     --depth=24
     --target-param-data-ratio=8
-    --device-batch-size=1
+    --device-batch-size="$DEVICE_BATCH_SIZE"
     --val-device-batch-size=16
     --save-every="$SAVE_EVERY"
     --save-keep-last=3
@@ -77,7 +81,7 @@ BASE_TRAIN_ARGS=(
     --run="$WANDB_RUN"
 )
 
-echo "nanoops fused: ${NANOOPS_FUSED:-0} (NPROC=$NPROC, save_every=$SAVE_EVERY, run=$WANDB_RUN)"
+echo "nanoops fused: ${NANOOPS_FUSED:-0} (NPROC=$NPROC, device_batch_size=$DEVICE_BATCH_SIZE, save_every=$SAVE_EVERY, run=$WANDB_RUN)"
 
 # NPROC=1: launch via plain python (NOT torchrun). torchrun unconditionally
 # sets RANK / LOCAL_RANK / WORLD_SIZE in env, which makes nanchat's
@@ -99,7 +103,7 @@ else
     torchrun --standalone --nproc_per_node=$NPROC -m scripts.base_train -- \
         "${BASE_TRAIN_ARGS[@]}" "$@"
 fi
-# --depth=24 / device-batch-size=1 on 2× RTX 3090 (24 GiB each):
+# Historical checkpoint-heavy --depth=24 / device-batch-size=1 on 2× RTX 3090:
 # d24 auto-widens to D=1536, n_layer=24, ~1.5B params, ~1.67× heavier than
 # d20. Even with all three optimizations active (sliding window +
 # expandable_segments + MLP_CHECKPOINT) only B=1 fits — B=2 OOMs by ~20 MiB,

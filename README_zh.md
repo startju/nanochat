@@ -43,18 +43,13 @@ H100 只有在 **wall-time per run 超过 debug 迭代时间**时才划算——
    在白板上的推导。
 
 2. **在 24 GiB 消费级 GPU 上同时优化 nanchat 训练的两个维度：速度 和
-   模型大小。** nanchat 的目标硬件是 H100 + FA3；在 3090 上 PyTorch
-   SDPA 遇到 sliding window mask 时会退化到慢路径，nanoops 的手写
-   算子绕开这条退化路径（**速度**维度——d20 base-train 从 22.7k 涨到
-   ~30.5k tok/s，+34% 吞吐）。Python 层的 `SlidingWindowSDPA`（按
-   window 分块算 attention，P 矩阵峰值砍 ~4×）+ MLP activation
-   checkpoint 再省 ~3.7 GiB + **优化器 state CPU offload**（把 Muon +
-   AdamW state 搬到 CPU pinned memory，d24 上 ZeRO-1 后还省 ~3 GiB）
-   —— 这三个一起打开**模型大小**维度：`--depth=24`（nanchat 参考模型
-   尺寸，~1.5 B 参数，原本在 24 GiB 卡上任何 batch size 都 OOM）现在能
-   以 `--device-batch-size=1` 在一张或两张 3090 上装下并跑起来。所以
-   消费级硬件既能**训得更快**（小配置吞吐拉满）又能**训原本根本装不下
-   的更大模型**。
+   模型大小。** nanoops 现在有两层执行路径：第一层是上面说的 Python
+   `autograd.Function` 教学实现；第二层是训练主路径的 Triton full-fuse：
+   `fused_mlp`、`fused_attn_qkv_projection`、`fused_attn_spda_and_output`。
+   旧的 Triton fused CE tail 已删除；lm-head / softcap / CE 继续走标准
+   nanoops functional 路径。配合 optimizer-state CPU offload 和
+   expandable-segments allocator，消费级 24 GiB GPU 既能装下 d24，也能把
+   编译后的训练 step 往前推。
 
 ### 实际效果
 
@@ -65,18 +60,21 @@ H100 只有在 **wall-time per run 超过 debug 迭代时间**时才划算——
 layer 的完整 `(L, L)` attention 概率矩阵——加起来就是装不下。nanchat 的
 参考硬件是 8× H100 节点——**对在家学习或预算有限的人来说远超能力**。
 
-本 fork 的全套优化（SlidingWindowSDPA 把 chunked attention 砍到带状、
-不存完整 P + MLP activation checkpoint + 优化器 state CPU offload +
-`expandable_segments` allocator）省够内存 + 抑制 allocator 碎片，让 d24
-终于能在 24 GiB 消费级显卡上以 `--device-batch-size=1` **真的装下并跑
-起来**——不管是**一张**卡还是**两张**。双卡通过 DDP 数据并行把同一份
+本 fork 的显存栈（带状/sliding attention、可选 activation checkpoint、
+优化器 state CPU offload、`expandable_segments` allocator）省够内存并抑制
+allocator 碎片，让 d24 终于能在 24 GiB 消费级显卡上以
+`--device-batch-size=1` **真的装下并跑起来**——不管是**一张**卡还是
+**两张**。Triton full-fuse 路径继续优化训练 step 本身，并在双 3090 上默认
+`--device-batch-size=2`：fused MLP、fused QKV/rotary/QK-norm/VE、
+fused SDPA/output-projection handoff。双卡通过 DDP 数据并行把同一份
 per-iter 工作量分担到两块 GPU，把 wall time 减半，但峰值显存跟单卡相同。
-**这个项目的意义就是把 nanchat 的默认训练拉进初学者硬件预算的范围**。
+**这个项目的意义就是把 nanchat 的默认训练拉进
+初学者硬件预算的范围**。
 
 | 配置             | nanchat 原生 | nanoops, 1× 24 GiB 卡 | nanoops, 2× 24 GiB 卡 |
 | ---------------- | ------------ | --------------------- | --------------------- |
 | `--depth=20`, B=4 | OOM (无 FA3) | (同样配方装得下)     | **~30.5k tok/s**, ~31h |
-| `--depth=24`, B=1 | 任意 B 都 OOM | **~8k tok/s**, ~200h | **~16k tok/s**, ~101h |
+| `--depth=24`, B=1/2 | 任意 B 都 OOM | **~8k tok/s**, ~200h | **~16k tok/s** checkpoint-heavy B=1；**~19.5k tok/s** full-fuse B=2 |
 
 **算成钱**：3090 spot 租赁价 ~$0.18/卡/小时，单卡 ~$0.18/h（~$30/周）、
 双卡 ~$0.36/h（~$60/周）。一次完整的 `--depth=24` 训练：**双卡 ~4.2 天
@@ -105,28 +103,60 @@ print、跑个 20-iter 看 loss 曲线和 MFU 怎么变。整套代码量小到�
 所有行 loss 曲线在 bf16 数值噪声范围内**完全一致**。完整 A/B 分析记录在
 [`SlidingWindowSDPA` 的 docstring](nanoops/functional.py)。
 
+当前 d24 full-fuse 路径（`NANOOPS_FUSED=1`，2× RTX 3090，B=2，compile/eval
+warmup 后）大约是 **53.8 s/step**、**19.5k tok/s**、**~65.6% MFU**。
+更看重显存余量而不是单步耗时时，可以用 `NANOOPS_FUSED=0` 切回
+checkpoint-heavy 路径。
+
+### `NANOOPS_FUSED=1` 覆盖哪些能力
+
+默认 fused 路径不是简单把 `F.linear` 换快一点，而是把 transformer block
+热路径上的链式算子换成 torch.compile 可见的 Triton custom op：
+
+- `fused_mlp`：pre-RMSNorm、`c_fc`、ReLU²、`c_proj`、residual add，以及对应
+  backward。
+- `fused_attn_qkv_projection`：residual/x0 混合、RMSNorm、独立 Q/K/V
+  projection、rotary、Q/K RMSNorm+scale、可选 value embedding gate/lookup，
+  以及对应 backward。
+- `fused_attn_spda_and_output`：GQA/sliding-window SDPA 加 attention output
+  projection/residual tail，包括原本分开的 backward delta/output-proj 计算。
+- `fused_add_norm`：独立 add+RMSNorm Triton op，也被 block 级 fused kernel 复用。
+
+lm-head / softcap / cross-entropy tail 刻意保留在标准 nanoops functional 路径；
+实验性的 Triton CE tail 已删除，因为它能省显存，但相对 native GEMM 主路径
+吞吐损失太大。
+
 ### 怎么跑
 
 ```bash
 # speedrun.sh 中 base_train 步骤的 drop-in 替代版——
-# 默认 --depth=24 --device-batch-size=1（24 GiB 消费级显卡装得下的最大 nanchat 配置）。
-# 五项优化默认开启：sliding-window SDPA + 全 attention chunked + MLP activation
-# checkpoint + 优化器 state CPU offload + expandable_segments allocator。
-bash nanoops/train.sh                       # 用所有可见 GPU
+# 默认 --depth=24。默认路径是 full-fuse，device-batch-size=2：
+# fused MLP + fused QKV + fused SDPA/output，
+# 不开 activation checkpoint，optimizer state offload 到 CPU，并在 CUDA init 前
+# 设置 expandable_segments。
+bash nanoops/train.sh                       # full-fuse，用所有可见 GPU
 NPROC=1 bash nanoops/train.sh               # 单卡——同样的配方依然装得下
+NANOOPS_FUSED=0 bash nanoops/train.sh       # 显存优先的 checkpoint-heavy 路径
 
 # 也可以覆盖默认值——比如双卡 3090 上吞吐最大的 setup：
 bash nanoops/train.sh --depth=20 --device-batch-size=4
 
-# 自动设置的环境变量（train.sh 帮你 export）：
+# 有效默认值 / 环境变量：
 #   NANOOPS=1                                       启用 nanoops 集成
 #   PYTORCH_ALLOC_CONF=expandable_segments:True     回收碎片化内存
-#   NANOOPS_MLP_CHECKPOINT=1                        省 ~3.7 GiB peak
 #   NANOOPS_OFFLOAD_OPTIM=1                         Muon+AdamW state 移到 CPU pinned;
 #                                                    d24+B=1 装下的必要条件
+#   NANOOPS_FUSED_MLP=1                             fused Triton MLP block
+#   NANOOPS_FUSED_ATTN=1                            fused QKV + SDPA/output
+#   NANOOPS_DEVICE_BATCH_SIZE=2                     full-fuse 默认 micro-batch
+#   NANOOPS_SAVE_EVERY=200                          checkpoint 间隔
 #
-# Opt-in 实验开关：
-#   NANOOPS_LOOKUP_SORTED=1       试一下"排序+分段求和"的 embedding backward
+# 模式开关：
+#   NANOOPS_FUSED=1                                  默认：full-fuse 性能路径
+#   NANOOPS_FUSED=0                                  显存优先 checkpoint 路径
+#   NANOOPS_MLP_CHECKPOINT=1                         显存优先的 MLP checkpoint
+#   NANOOPS_L_ATTN_CHECKPOINT=1                      显存优先的 L-attn checkpoint
+#   NANOOPS_LOOKUP_SORTED=1                          segmented embedding backward
 ```
 
 详见：

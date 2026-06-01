@@ -980,9 +980,9 @@ def cross_entropy(
     input: torch.Tensor,
     target: torch.Tensor,
     weight: torch.Tensor | None = None,
-    size_average=None,  # deprecated in PyTorch
+    size_average: bool | None = None,  # deprecated in PyTorch
     ignore_index: int = -100,
-    reduce=None,  # deprecated in PyTorch
+    reduce: bool | None = None,  # deprecated in PyTorch
     reduction: str = "mean",
     label_smoothing: float = 0.0,
     dim: int = -1,
@@ -1243,8 +1243,8 @@ class Roll(torch.autograd.Function):
     def forward(
         ctx: torch.autograd.function.FunctionCtx,
         input: torch.Tensor,
-        shifts,
-        dims=None,
+        shifts: int | tuple[int, ...],
+        dims: int | tuple[int, ...] | None = None,
     ) -> torch.Tensor:
         ctx.shifts = shifts
         ctx.dims = dims
@@ -1263,7 +1263,11 @@ class Roll(torch.autograd.Function):
 
 
 @_allow_in_graph
-def roll(input: torch.Tensor, shifts, dims=None) -> torch.Tensor:
+def roll(
+    input: torch.Tensor,
+    shifts: int | tuple[int, ...],
+    dims: int | tuple[int, ...] | None = None,
+) -> torch.Tensor:
     """Mirrors `torch.roll`. shifts: int or tuple; dims: int, tuple, or None."""
     return Roll.apply(input, shifts, dims)
 
@@ -1568,7 +1572,15 @@ class SlidingWindowSDPA(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, query, key, value, window_size, enable_gqa=False, chunk_size=None):
+    def forward(
+        ctx: torch.autograd.function.FunctionCtx,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        window_size: int,
+        enable_gqa: bool = False,
+        chunk_size: int | None = None,
+    ) -> torch.Tensor:
         B, H_q, L, D = query.shape
         H_kv = key.shape[-3]
         W = window_size
@@ -1646,7 +1658,9 @@ class SlidingWindowSDPA(torch.autograd.Function):
         return output
 
     @staticmethod
-    def backward(ctx, grad_output):
+    def backward(
+        ctx: torch.autograd.function.FunctionCtx, grad_output: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, None, None, None]:
         saved = ctx.saved_tensors
         query, key, value = saved[0], saved[1], saved[2]
         lse_list = saved[3:]
