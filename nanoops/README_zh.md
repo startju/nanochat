@@ -80,10 +80,12 @@ Tier 2 加入注意力；Tier 3 是可选的性能优化版本。
       `c_q.weight, c_k.weight, c_v.weight` 在 dim 0 上拼接得到，并在写回前
       对 Q/K 做 rotary、QK RMSNorm 和 scale。它覆盖 SDPA 之前的 QKV-side
       setup。
+- [x] **`fused_cross_entropy`**：融合 lm-head projection、logit softcap 和
+      cross entropy。训练 loss 路径按 vocab tile 流式处理，只保存每个 token
+      一条 LSE，不物化完整 `(B*T, vocab)` logits。
 
-这两个覆盖了 transformer block 里最重的 "norm + linear 链" 入口。再往下
-（完整的 Flash-style SDPA、logit softcap 等）超出 nanoops 教学范围 ——
-需要多 kernel 的研究级工程量。
+block 级 fused kernel 覆盖 transformer block 里最重的 "norm + linear 链"
+入口；`fused_cross_entropy` 覆盖显存最重的训练 loss tail。
 
 ### 新增算子流程
 

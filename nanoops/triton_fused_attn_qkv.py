@@ -398,8 +398,7 @@ if _HAS_TRITON:
                 x_norm_ptr + rows[:, None] * K + gate_cols[None, :],
                 mask=row_mask[:, None] & gate_mask[None, :],
                 other=0.0,
-            ).to(x_norm_ptr.dtype.element_ty)
-
+            )
             d_v = tl.load(
                 d_v_ptr
                 + rows[:, None] * N_KV_HEAD * D
@@ -407,7 +406,7 @@ if _HAS_TRITON:
                 + cols[None, :],
                 mask=row_mask[:, None],
                 other=0.0,
-            ).to(x_norm_ptr.dtype.element_ty)
+            )
             gate_w = tl.load(
                 ve_gate_w_ptr + head * VE_GATE_CH + gate_cols,
                 mask=gate_mask,
@@ -469,13 +468,15 @@ if _HAS_TRITON:
                 mask=row_mask[:, None],
                 other=0.0,
             )
-            y0 = (y0 * inv_scale).to(d_q_pre_ptr.dtype.element_ty)
+            inv_scale_t = inv_scale.to(y0.dtype)
+            y0 = y0 * inv_scale_t
             g = tl.load(
                 grad_base + cols[None, :],
                 mask=row_mask[:, None],
                 other=0.0,
             )
-            g = (g * scale).to(d_q_pre_ptr.dtype.element_ty)
+            scale_t = scale.to(g.dtype)
+            g = g * scale_t
             qk_rms_inv = tl.load(
                 qk_rms_inv_ptr + rows * (N_HEAD + N_KV_HEAD) + part,
                 mask=row_mask,
@@ -1104,12 +1105,6 @@ def _fused_attn_qkv_projection_bwd_impl(
     x_norm = torch.empty_like(x_base_flat)
     d_q_pre = torch.empty_like(saved_q)
     d_k_pre = torch.empty_like(saved_k)
-    dx_hat = torch.empty_like(x_base_flat)
-    outer_rms_row_inner = torch.zeros((M,), dtype=torch.float32, device=x_base.device)
-    dx = torch.empty_like(x_base_flat)
-    dx0 = torch.empty_like(x0_flat)
-    d_resid_scale = torch.zeros_like(resid_scale)
-    d_x0_scale = torch.zeros_like(x0_scale)
     d_ve_weight = None
     d_ve_gate_weight = None
     ve_gate_block = triton.next_power_of_2(ve_gate_channels)
@@ -1233,6 +1228,13 @@ def _fused_attn_qkv_projection_bwd_impl(
     # Phase 3: project Q/K/V grads back to x_hat and accumulate RMS row inner.
     # d24 uses half-head tiles and loads projection weights in their native
     # dtype; the Triton kernel casts tiles to activation dtype where needed.
+    #
+    # Allocate the materialized dx_hat as late as possible. At B=4 the compiled
+    # backward peak is tight enough that allocating this 24 MiB buffer before
+    # SDPA dQ has been consumed can OOM, even though the steady-state graph
+    # would fit after dQ/dK are free.
+    dx_hat = torch.empty_like(x_base_flat)
+    outer_rms_row_inner = torch.zeros((M,), dtype=torch.float32, device=x_base.device)
     wrap_triton(_fused_attn_qkv_projection_dx_hat_bwd_kernel)[
         (triton.cdiv(M, DX_HAT_BLOCK_M), triton.cdiv(K, DX_HAT_BLOCK_K))
     ](
@@ -1262,6 +1264,10 @@ def _fused_attn_qkv_projection_bwd_impl(
         num_stages=DX_HAT_NUM_STAGES,
     )
     # Phase 4: finish outer RMSNorm input gradient.
+    dx = torch.empty_like(x_base_flat)
+    dx0 = torch.empty_like(x0_flat)
+    d_resid_scale = torch.zeros_like(resid_scale)
+    d_x0_scale = torch.zeros_like(x0_scale)
     wrap_triton(_fused_attn_qkv_projection_outer_rms_dx_bwd_kernel)[
         (triton.cdiv(M, OUTER_RMS_BLOCK_M), triton.cdiv(K, OUTER_RMS_BLOCK_K))
     ](

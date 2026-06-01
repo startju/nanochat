@@ -89,11 +89,13 @@ adds optional fast-path variants.
       `concat([c_q.weight, c_k.weight, c_v.weight])`, with Q/K rotary,
       QK RMSNorm, and scale applied before writeback. This covers the
       QKV-side setup before SDPA.
+- [x] **`fused_cross_entropy`**: fused lm-head projection + logit softcap +
+      cross entropy. The training loss path streams vocab tiles and saves
+      per-token LSE instead of materializing the full `(B*T, vocab)` logits.
 
-These two cover the heaviest "norm + linear chain" entries of the
-transformer block. Further fusions (full Flash-style SDPA, logit
-softcap, etc.) are out of scope for nanoops's teaching focus — they
-need multi-kernel research-level engineering.
+The block-level fused kernels cover the heaviest "norm + linear chain" entries
+of the transformer block; `fused_cross_entropy` covers the memory-heavy
+training loss tail.
 
 ### Conventions for each new op
 

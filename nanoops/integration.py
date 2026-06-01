@@ -30,6 +30,7 @@ Patched ops:
     nanochat.gpt.MLP.forward             — relu_square fused
                                              + optional MLP activation ckpt
     nanochat.gpt.GPT.forward             — optional fused attention QKV path
+                                             + optional fused lm-head CE tail
     nanochat.gpt.CausalSelfAttention.forward
                                           — optional L-layer activation ckpt
     nanochat.optim.DistMuonAdamW._compute_adamw / _compute_muon
@@ -165,6 +166,7 @@ _orig_norm = None
 _fused_mlp = None
 _fused_attn_qkv = None
 _fused_attn_tail = None
+_fused_cross_entropy = None
 
 
 def _rms_norm_no_weight(x: torch.Tensor) -> torch.Tensor:
@@ -309,23 +311,54 @@ def _patched_gpt_forward(self, idx, targets=None, kv_cache=None, loss_reduction=
         if i == backout_layer:
             x_backout = x
 
+    if targets is not None:
+        if _fused_cross_entropy is not None and x_backout is not None:
+            return _fused_cross_entropy(
+                x.contiguous(),
+                self.lm_head.weight.contiguous(),
+                targets.contiguous(),
+                self.config.vocab_size,
+                15.0,
+                -1,
+                loss_reduction,
+                x_backout=x_backout.contiguous(),
+                backout_scale=self.backout_lambda,
+                eps=1e-6,
+            )
+
     if x_backout is not None:
         x = x - self.backout_lambda.to(x.dtype) * x_backout
     x = _rms_norm_no_weight(x)
 
-    softcap = 15
-    logits = self.lm_head(x)
-    logits = logits[..., : self.config.vocab_size]
-    logits = logits.float()
-    logits = softcap * torch.tanh(logits / softcap)
-
     if targets is not None:
+        if _fused_cross_entropy is not None:
+            return _fused_cross_entropy(
+                x.contiguous(),
+                self.lm_head.weight.contiguous(),
+                targets.contiguous(),
+                self.config.vocab_size,
+                15.0,
+                -1,
+                loss_reduction,
+            )
+
+        softcap = 15
+        logits = self.lm_head(x)
+        logits = logits[..., : self.config.vocab_size]
+        logits = logits.float()
+        logits = softcap * torch.tanh(logits / softcap)
         return nF.cross_entropy(
             logits.view(-1, logits.size(-1)),
             targets.view(-1),
             ignore_index=-1,
             reduction=loss_reduction,
         )
+
+    softcap = 15
+    logits = self.lm_head(x)
+    logits = logits[..., : self.config.vocab_size]
+    logits = logits.float()
+    logits = softcap * torch.tanh(logits / softcap)
     return logits
 
 
@@ -400,7 +433,7 @@ def _apply() -> dict[str, dict]:
     instead of the true originals.
     """
     global _PATCHED, _orig_attn_forward, _orig_gpt_forward, _orig_norm
-    global _fused_mlp, _fused_attn_qkv, _fused_attn_tail
+    global _fused_mlp, _fused_attn_qkv, _fused_attn_tail, _fused_cross_entropy
     if _PATCHED:
         raise RuntimeError(
             "nanoops.integration already patched; call _restore() before _apply() again"
@@ -458,6 +491,10 @@ def _apply() -> dict[str, dict]:
         _orig_gpt_forward = gpt_mod.GPT.forward
         _fused_attn_qkv = _nqp
         _fused_attn_tail = _tail
+        if os.environ.get("NANOOPS_FUSED_CROSS_ENTROPY"):
+            from .triton_fused_cross_entropy import fused_cross_entropy as _fce
+
+            _fused_cross_entropy = _fce
         originals["method"][("nanochat.gpt", "GPT", "forward")] = _orig_gpt_forward
         gpt_mod.GPT.forward = _patched_gpt_forward
     # L-layer activation checkpoint: opt-in via NANOOPS_L_ATTN_CHECKPOINT=1.
@@ -517,7 +554,7 @@ def _restore(originals: dict[str, dict]) -> None:
         cls = getattr(importlib.import_module(modname), cls_name)
         setattr(cls, method_name, original)
     global _PATCHED, _orig_attn_forward, _orig_gpt_forward, _orig_norm
-    global _fused_mlp, _fused_attn_qkv, _fused_attn_tail
+    global _fused_mlp, _fused_attn_qkv, _fused_attn_tail, _fused_cross_entropy
     _PATCHED = False
     _orig_attn_forward = None
     _orig_gpt_forward = None
@@ -525,6 +562,7 @@ def _restore(originals: dict[str, dict]) -> None:
     _fused_mlp = None
     _fused_attn_qkv = None
     _fused_attn_tail = None
+    _fused_cross_entropy = None
 
 
 def patch_nanchat() -> list[str]:
@@ -546,6 +584,10 @@ def patch_nanchat() -> list[str]:
         names.append("Block.forward(fused_mlp — supersedes relu_square fusion)")
     if os.environ.get("NANOOPS_FUSED_ATTN"):
         names.append("GPT.forward(fused_attn_qkv_projection + fused_attn_spda_and_output fused)")
+    if os.environ.get("NANOOPS_FUSED_ATTN") and os.environ.get(
+        "NANOOPS_FUSED_CROSS_ENTROPY"
+    ):
+        names.append("GPT.forward(fused_cross_entropy loss tail)")
     return names
 
 
