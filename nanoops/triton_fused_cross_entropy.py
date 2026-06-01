@@ -1,4 +1,4 @@
-"""Memory-efficient fused lm-head + softcap + cross entropy.
+"""Fused lm-head tail helpers for softcap + cross entropy.
 
 Public entry: `fused_cross_entropy`.
 
@@ -17,10 +17,9 @@ absorbs the model tail that normally runs before lm-head projection:
 
 and the lm-head projection consumes `x_norm`.
 
-The key memory property is that `(M, V)` logits are never materialized. Triton
-kernels stream vocab tiles, save only one fp32 `lse` value per token row, and
-recompute logits in backward for `dx` and `d_weight`. The final-tail path saves
-one additional fp32 `rms_inv` value per token row.
+The training fast path keeps the lm-head as one large GEMM, then uses Triton
+for softcap + CE over the raw bf16 logits. That avoids native PyTorch's full
+fp32 softcapped-logits/log-softmax intermediates without fragmenting the GEMM.
 """
 
 from __future__ import annotations
@@ -61,6 +60,10 @@ _FUSED_CROSS_ENTROPY_DW_NUM_STAGES = 3
 _FUSED_CROSS_ENTROPY_NORM_BWD_BLOCK_M = 16
 _FUSED_CROSS_ENTROPY_NORM_BWD_BLOCK_K = 32
 _FUSED_CROSS_ENTROPY_NORM_BWD_NUM_WARPS = 4
+
+_SOFTCAP_CROSS_ENTROPY_BLOCK_V = 256
+_SOFTCAP_CROSS_ENTROPY_NUM_WARPS = 8
+_SOFTCAP_CROSS_ENTROPY_NUM_STAGES = 2
 
 
 if _HAS_TRITON:
@@ -632,6 +635,96 @@ if _HAS_TRITON:
             sem="relaxed",
         )
 
+    @triton.jit
+    def _softcap_cross_entropy_fwd_kernel(
+        logits_ptr,  # (M, V), activation dtype - in: raw lm-head logits
+        target_ptr,  # (M,), int64 - in
+        loss_ptr,  # (M,), fp32 - out
+        lse_ptr,  # (M,), fp32 - out
+        M,  # int
+        V: tl.constexpr,  # logical vocab size
+        SOFTCAP: tl.constexpr,
+        IGNORE_INDEX: tl.constexpr,
+        BLOCK_V: tl.constexpr,
+    ):
+        """Streaming softcap + CE over already-materialized raw logits.
+
+        This preserves the large lm-head GEMM outside the kernel and only
+        avoids materializing the fp32 softcapped logits/log-softmax tensors.
+        """
+        row = tl.program_id(0)
+        vocab_base = tl.arange(0, BLOCK_V)
+        target = tl.load(target_ptr + row)
+        valid = (row < M) & (target != IGNORE_INDEX) & (target >= 0) & (target < V)
+
+        row_max = tl.full((), -float("inf"), dtype=tl.float32)
+        row_sum = tl.full((), 0.0, dtype=tl.float32)
+        target_logit = tl.full((), 0.0, dtype=tl.float32)
+
+        for v_start in range(0, V, BLOCK_V):
+            vocab = v_start + vocab_base
+            vocab_mask = vocab < V
+            raw = tl.load(
+                logits_ptr + row * V + vocab,
+                mask=(row < M) & vocab_mask,
+                other=0.0,
+            ).to(tl.float32)
+            tanh_raw = 2.0 * tl.sigmoid((2.0 / SOFTCAP) * raw) - 1.0
+            logits = SOFTCAP * tanh_raw
+            logits = tl.where(vocab_mask, logits, -float("inf"))
+
+            tile_max = tl.max(logits, axis=0)
+            new_max = tl.maximum(row_max, tile_max)
+            row_sum = row_sum * tl.exp(row_max - new_max) + tl.sum(
+                tl.exp(logits - new_max),
+                axis=0,
+            )
+            row_max = new_max
+            target_logit += tl.sum(tl.where(vocab == target, logits, 0.0), axis=0)
+
+        lse = row_max + tl.log(row_sum)
+        loss = tl.where(valid, lse - target_logit, 0.0)
+        tl.store(loss_ptr + row, loss, mask=row < M)
+        tl.store(lse_ptr + row, lse, mask=row < M)
+
+    @triton.jit
+    def _softcap_cross_entropy_bwd_kernel(
+        logits_ptr,  # (M, V), activation dtype - in: raw lm-head logits
+        target_ptr,  # (M,), int64 - in
+        lse_ptr,  # (M,), fp32 - in
+        grad_loss_ptr,  # (M,), fp32 - in
+        dlogits_ptr,  # (M, V), activation dtype - out
+        M,  # int
+        V: tl.constexpr,
+        SOFTCAP: tl.constexpr,
+        IGNORE_INDEX: tl.constexpr,
+        BLOCK_V: tl.constexpr,
+    ):
+        """Compute d(raw logits) for softcap + CE; GEMM grads stay in PyTorch."""
+        row = tl.program_id(0)
+        pid_v = tl.program_id(1)
+        vocab = pid_v * BLOCK_V + tl.arange(0, BLOCK_V)
+        mask = (row < M) & (vocab < V)
+
+        target = tl.load(target_ptr + row, mask=row < M, other=IGNORE_INDEX)
+        valid = (row < M) & (target != IGNORE_INDEX) & (target >= 0) & (target < V)
+        lse = tl.load(lse_ptr + row, mask=row < M, other=0.0)
+        grad_loss = tl.load(grad_loss_ptr + row, mask=row < M, other=0.0)
+        raw = tl.load(logits_ptr + row * V + vocab, mask=mask, other=0.0).to(tl.float32)
+
+        tanh_raw = 2.0 * tl.sigmoid((2.0 / SOFTCAP) * raw) - 1.0
+        logits = SOFTCAP * tanh_raw
+        prob = tl.exp(logits - lse)
+        one_hot = vocab == target
+        dlogits = (prob - tl.where(one_hot, 1.0, 0.0)) * grad_loss
+        dlogits = tl.where(valid & (vocab < V), dlogits, 0.0)
+        draw = dlogits * (1.0 - tanh_raw * tanh_raw)
+        tl.store(
+            dlogits_ptr + row * V + vocab,
+            draw.to(dlogits_ptr.dtype.element_ty),
+            mask=mask,
+        )
+
 
 def _fused_cross_entropy_fwd_impl(
     x: torch.Tensor,
@@ -917,6 +1010,81 @@ def _fused_cross_entropy_norm_bwd_impl(
     return dx, dx_backout, d_backout_scale, dweight
 
 
+def _softcap_cross_entropy_fwd_impl(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    softcap: float,
+    ignore_index: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return per-token CE loss and LSE from raw `(M,V)` logits.
+
+    The raw lm-head logits are materialized by one large PyTorch GEMM before
+    this helper. Triton only streams over that matrix to avoid the native path's
+    full fp32 softcapped-logits/log-softmax intermediates.
+    """
+    if not _HAS_TRITON:
+        raise RuntimeError("softcap_cross_entropy requires triton")
+    assert logits.is_cuda and target.is_cuda
+    assert logits.is_contiguous() and target.is_contiguous()
+    assert logits.ndim == 2 and target.ndim == 1
+    M, V = logits.shape
+    assert target.shape == (M,)
+
+    loss = torch.empty((M,), dtype=torch.float32, device=logits.device)
+    lse = torch.empty((M,), dtype=torch.float32, device=logits.device)
+    wrap_triton(_softcap_cross_entropy_fwd_kernel)[(M,)](
+        logits,
+        target,
+        loss,
+        lse,
+        M,
+        V=V,
+        SOFTCAP=softcap,
+        IGNORE_INDEX=ignore_index,
+        BLOCK_V=_SOFTCAP_CROSS_ENTROPY_BLOCK_V,
+        num_warps=_SOFTCAP_CROSS_ENTROPY_NUM_WARPS,
+        num_stages=_SOFTCAP_CROSS_ENTROPY_NUM_STAGES,
+    )
+    return loss, lse
+
+
+def _softcap_cross_entropy_bwd_impl(
+    grad_loss: torch.Tensor,
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    lse: torch.Tensor,
+    softcap: float,
+    ignore_index: int,
+) -> torch.Tensor:
+    """Return d(raw logits) for the GEMM-backed fused CE path."""
+    if not _HAS_TRITON:
+        raise RuntimeError("softcap_cross_entropy backward requires triton")
+    grad_loss = grad_loss.contiguous()
+    assert logits.is_cuda and target.is_cuda and lse.is_cuda and grad_loss.is_cuda
+    assert logits.is_contiguous() and target.is_contiguous() and lse.is_contiguous()
+    assert grad_loss.is_contiguous()
+    M, V = logits.shape
+    assert target.shape == (M,) and lse.shape == (M,) and grad_loss.shape == (M,)
+
+    dlogits = torch.empty_like(logits)
+    grid = (M, triton.cdiv(V, _SOFTCAP_CROSS_ENTROPY_BLOCK_V))
+    wrap_triton(_softcap_cross_entropy_bwd_kernel)[grid](
+        logits,
+        target,
+        lse,
+        grad_loss,
+        dlogits,
+        M,
+        V=V,
+        SOFTCAP=softcap,
+        IGNORE_INDEX=ignore_index,
+        BLOCK_V=_SOFTCAP_CROSS_ENTROPY_BLOCK_V,
+        num_warps=_SOFTCAP_CROSS_ENTROPY_NUM_WARPS,
+        num_stages=_SOFTCAP_CROSS_ENTROPY_NUM_STAGES,
+    )
+    return dlogits
+
+
 @torch.library.triton_op(
     "nanoops::fused_cross_entropy_fwd",
     mutates_args=(),
@@ -1133,6 +1301,80 @@ _fused_cross_entropy_norm_fwd_op.register_autograd(
 )
 
 
+@torch.library.triton_op(
+    "nanoops::softcap_cross_entropy_fwd",
+    mutates_args=(),
+)
+def _softcap_cross_entropy_fwd_op(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    softcap: float,
+    ignore_index: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Triton-op forward for raw-logits softcap + CE."""
+    return _softcap_cross_entropy_fwd_impl(logits, target, softcap, ignore_index)
+
+
+@torch.library.triton_op(
+    "nanoops::softcap_cross_entropy_bwd",
+    mutates_args=(),
+)
+def _softcap_cross_entropy_bwd_op(
+    grad_loss: torch.Tensor,
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    lse: torch.Tensor,
+    softcap: float,
+    ignore_index: int,
+) -> torch.Tensor:
+    """Triton-op backward returning d(raw logits)."""
+    return _softcap_cross_entropy_bwd_impl(
+        grad_loss,
+        logits,
+        target,
+        lse,
+        softcap,
+        ignore_index,
+    )
+
+
+def _softcap_cross_entropy_setup_context(
+    ctx: Any,
+    inputs: tuple[torch.Tensor, torch.Tensor, float, int],
+    output: tuple[torch.Tensor, torch.Tensor],
+) -> None:
+    """Save raw logits and LSE so backward can produce d(raw logits)."""
+    logits, target, softcap, ignore_index = inputs
+    _loss, lse = output
+    ctx.save_for_backward(logits, target, lse)
+    ctx.softcap = softcap
+    ctx.ignore_index = ignore_index
+
+
+def _softcap_cross_entropy_autograd_backward(
+    ctx: Any,
+    grad_loss: torch.Tensor,
+    _grad_lse: torch.Tensor,
+) -> tuple[torch.Tensor, None, None, None]:
+    """Autograd callback for `nanoops::softcap_cross_entropy_fwd`."""
+    logits, target, lse = ctx.saved_tensors
+    dlogits = _softcap_cross_entropy_bwd_op(
+        grad_loss,
+        logits,
+        target,
+        lse,
+        ctx.softcap,
+        ctx.ignore_index,
+    )
+    return dlogits, None, None, None
+
+
+_softcap_cross_entropy_fwd_op.register_autograd(
+    _softcap_cross_entropy_autograd_backward,
+    setup_context=_softcap_cross_entropy_setup_context,
+)
+
+
 def fused_cross_entropy(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -1208,11 +1450,11 @@ def fused_cross_entropy(
         x_2d = x_2d - backout_scale.to(dtype=x.dtype) * x_backout_2d
         x_2d = F.rms_norm(x_2d, (K,), eps=eps).contiguous()
 
-    per_token, _lse = _fused_cross_entropy_fwd_op(
-        x_2d,
-        weight,
+    raw_logits = x_2d @ weight[:vocab_size].to(dtype=x.dtype).t()
+    raw_logits = raw_logits.contiguous()
+    per_token, _lse = _softcap_cross_entropy_fwd_op(
+        raw_logits,
         target_1d,
-        vocab_size,
         softcap,
         ignore_index,
     )

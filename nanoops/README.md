@@ -90,8 +90,9 @@ adds optional fast-path variants.
       QK RMSNorm, and scale applied before writeback. This covers the
       QKV-side setup before SDPA.
 - [x] **`fused_cross_entropy`**: fused lm-head projection + logit softcap +
-      cross entropy. The training loss path streams vocab tiles and saves
-      per-token LSE instead of materializing the full `(B*T, vocab)` logits.
+      cross entropy. The training loss path keeps lm-head as one large GEMM,
+      then uses Triton for softcap + CE over raw bf16 logits to avoid the
+      native path's full fp32 softcapped-logits/log-softmax intermediates.
 
 The block-level fused kernels cover the heaviest "norm + linear chain" entries
 of the transformer block; `fused_cross_entropy` covers the memory-heavy

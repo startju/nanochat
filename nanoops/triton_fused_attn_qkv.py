@@ -468,14 +468,14 @@ if _HAS_TRITON:
                 mask=row_mask[:, None],
                 other=0.0,
             )
-            inv_scale_t = inv_scale.to(y0.dtype)
+            inv_scale_t = inv_scale * tl.full((), 1.0, dtype=y0.dtype)
             y0 = y0 * inv_scale_t
             g = tl.load(
                 grad_base + cols[None, :],
                 mask=row_mask[:, None],
                 other=0.0,
             )
-            scale_t = scale.to(g.dtype)
+            scale_t = scale * tl.full((), 1.0, dtype=g.dtype)
             g = g * scale_t
             qk_rms_inv = tl.load(
                 qk_rms_inv_ptr + rows * (N_HEAD + N_KV_HEAD) + part,
