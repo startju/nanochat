@@ -77,18 +77,32 @@ per-iter 工作量分担到两块 GPU，把 wall time 减半，但峰值显存�
 | `--depth=24`, B=1/2 | 任意 B 都 OOM | **~8k tok/s**, ~200h | **~16k tok/s** checkpoint-heavy B=1；**~19.5k tok/s** full-fuse B=2 |
 
 **算成钱**：3090 spot 租赁价 ~$0.18/卡/小时，单卡 ~$0.18/h（~$30/周）、
-双卡 ~$0.36/h（~$60/周）。一次完整的 `--depth=24` 训练：**双卡 ~4.2 天
-~$36**，**单卡 ~8.3 天 ~$36**（GPU-小时一样，DDP 只是把 wall time 折半）。
+双卡 ~$0.36/h（~$60/周）。一次完整的 `--depth=24` 训练：当前 full-fuse
+B=2 路径在双卡上约 **3.8-4.0 天，~$33-35**。其中纯训练 step 按实测
+~54.2 s/step 约 **3.5 天**，额外 wall time 来自默认 validation、checkpoint、
+CORE 和 sample 节奏。单卡显存优先路径仍大约是 **~8.3 天，~$36**。
 `--depth=20` 双卡训练 ~31h，**不到 $12**。原本目标硬件是 8× H100 节点，
 本 fork 让这个训练在一台桌面机（一或两张消费级 GPU）上可行。
 
-**很适合初学者上手**。即便跑较重的 d24 训练，一周预算里还剩 ~$24 /
-~2-3 天 GPU 时间正好用来"折腾"——读一下 `nanoops/functional.py` 里
+**很适合初学者上手**。即便跑较重的 d24 训练，一周预算里还剩 ~$25 /
+~3 天 GPU 时间正好用来"折腾"——读一下 `nanoops/functional.py` 里
 某个算子的实现、把某个 in-place trick 改掉、往 `.backward()` 加个
 print、跑个 20-iter 看 loss 曲线和 MFU 怎么变。整套代码量小到可以
 拿调试器一步步走完，配套测试（`tests/test_nanoops_e2e.py`,
 `tests/test_sdpa_parity.py` 等）会把每个算子跟 PyTorch reference
 对拍——**永远有 ground truth 可以参照**。
+
+### 当前 d24 性能（2× RTX 3090）
+
+| 配置 | dt/step | tok/sec | MFU | wall time / 成本 |
+| ---- | ------- | ------- | --- | ---------------- |
+| Checkpoint-heavy 显存优先，B=1 | ~66.5 s | ~15.8k | ~53% | 训练 ETA 约 61h；显存余量更保守 |
+| **Full-fuse，B=2（默认）** | **~54.2 s** | **~19.3k** | **~65%** | **纯训练 step 约 3.5 天；含默认 eval+checkpoint 节奏约 3.8-4.0 天 / $33-35** |
+
+full-fuse 行来自当前 d24 训练 compile/warmup 后的实测：
+`NANOOPS_FUSED=1`，fused MLP、fused QKV、fused SDPA/output，不开 activation
+checkpoint，optimizer state CPU offload，`device-batch-size=2`。更看重显存
+余量而不是单步耗时时，可以用 `NANOOPS_FUSED=0` 切回 checkpoint-heavy 路径。
 
 ### 实测加速过程（d20 base_train on RTX 3090，双卡数据）
 
@@ -102,11 +116,6 @@ print、跑个 20-iter 看 loss 曲线和 MFU 怎么变。整套代码量小到�
 
 所有行 loss 曲线在 bf16 数值噪声范围内**完全一致**。完整 A/B 分析记录在
 [`SlidingWindowSDPA` 的 docstring](nanoops/functional.py)。
-
-当前 d24 full-fuse 路径（`NANOOPS_FUSED=1`，2× RTX 3090，B=2，compile/eval
-warmup 后）大约是 **53.8 s/step**、**19.5k tok/s**、**~65.6% MFU**。
-更看重显存余量而不是单步耗时时，可以用 `NANOOPS_FUSED=0` 切回
-checkpoint-heavy 路径。
 
 ### `NANOOPS_FUSED=1` 覆盖哪些能力
 

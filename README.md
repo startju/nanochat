@@ -94,21 +94,35 @@ budget.**
 **Concretely:** at typical spot-rental rates of ~$0.18/GPU/hr for an
 RTX 3090, a single 3090 costs ~$0.18/hr (~$30/week) and a 2× 3090 rig
 ~$0.36/hr (~$60/week). A full `--depth=24` pretraining run costs
-roughly **$36 over ~4.2 days on dual-GPU** or **~$36 over ~8.3 days
-on single-GPU** (same GPU-hours either way — DDP just trades wall
-time for parallelism). `--depth=20` on dual-GPU finishes in ~31 h for
-under **$12**. The same training is otherwise targeted at 8× H100
-nodes; this fork makes it feasible on a desktop with one or two
-consumer GPUs.
+roughly **$33-35 over ~3.8-4.0 days on dual-GPU** with the current
+full-fuse B=2 path. The pure training-step time is ~3.5 days at the
+measured ~54.2 s/step; the extra wall time is the default validation,
+checkpoint, CORE, and sampling cadence. The single-GPU memory-first
+path is still roughly **~$36 over ~8.3 days**. `--depth=20` on dual-GPU
+finishes in ~31 h for under **$12**. The same training is otherwise
+targeted at 8× H100 nodes; this fork makes it feasible on a desktop
+with one or two consumer GPUs.
 
 **Good fit for learners.** Even at the heavier d24 budget there's still
-~$24 / ~2-3 days of GPU time left in a week to break the code on —
+~$25 / ~3 days of GPU time left in a week to break the code on —
 read an op in `nanoops/functional.py`, swap an in-place trick out, add
 a print to a `.backward()`, kick off a 20-iter run, and watch the loss
 curve / MFU drift. The whole stack is small enough to step through in
 a debugger, and the bundled tests (`tests/test_nanoops_e2e.py`,
 `tests/test_sdpa_parity.py`, ...) cross-check every op against
 PyTorch's reference — so you always have ground truth to compare against.
+
+### Current d24 performance (2× RTX 3090)
+
+| Config | dt/step | tok/sec | MFU | Wall time / cost |
+| ------ | ------- | ------- | --- | ---------------- |
+| Checkpoint-heavy memory-first, B=1 | ~66.5 s | ~15.8k | ~53% | ~61 h counted training ETA; lower memory headroom pressure |
+| **Full-fuse, B=2 (default)** | **~54.2 s** | **~19.3k** | **~65%** | **~3.5 days pure step time; ~3.8-4.0 days / $33-35 with default eval+checkpoint cadence** |
+
+The full-fuse row is from the current d24 run after compile/warmup, with
+`NANOOPS_FUSED=1`, fused MLP, fused QKV, fused SDPA/output, no activation
+checkpointing, optimizer-state CPU offload, and `device-batch-size=2`.
+Use `NANOOPS_FUSED=0` when memory headroom matters more than step time.
 
 ### Measured speedup journey (d20 base_train on a 3090, dual-GPU numbers)
 
@@ -123,11 +137,6 @@ PyTorch's reference — so you always have ground truth to compare against.
 Loss curves match across all rows to within bf16 rounding noise.
 Full A/B autopsy lives in the
 [`SlidingWindowSDPA` docstring](nanoops/functional.py).
-
-Current d24 full-fuse path (`NANOOPS_FUSED=1`, 2× RTX 3090, B=2, after
-compile/eval warmup) is about **53.8 s/step**, **19.5k tok/s**, and
-**~65.6% MFU**. Use `NANOOPS_FUSED=0` when memory headroom matters more
-than step time.
 
 ### What `NANOOPS_FUSED=1` covers
 
