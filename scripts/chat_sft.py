@@ -16,6 +16,7 @@ os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import time
 import wandb
 import torch
+from nanoops.integration import maybe_patch_nanchat
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
 from nanochat.tokenizer import get_token_bytes
 from nanochat.checkpoint_manager import save_checkpoint, load_model, load_optimizer_state
@@ -31,6 +32,9 @@ from tasks.mmlu import MMLU
 from tasks.smoltalk import SmolTalk
 from tasks.customjson import CustomJSON
 from tasks.spellingbee import SimpleSpelling, SpellingBee
+
+# Opt-in nanoops swap: same entry hook as base_train, gated by NANOOPS=1.
+maybe_patch_nanchat()
 
 # -----------------------------------------------------------------------------
 # CLI arguments
@@ -144,6 +148,10 @@ if args.load_optimizer:
         base_lrs = [group["lr"] for group in optimizer.param_groups]
         optimizer.load_state_dict(optimizer_data)
         del optimizer_data
+        if os.environ.get("NANOOPS_OFFLOAD_OPTIM"):
+            from nanoops.cpu_offload import migrate_optimizer_state_to_cpu_pinned
+            migrate_optimizer_state_to_cpu_pinned(optimizer)
+            print0("[nanoops] migrated resumed optimizer state to CPU pinned memory")
         for group, base_lr in zip(optimizer.param_groups, base_lrs):
             group["lr"] = base_lr
         print0("Loaded optimizer state from pretrained checkpoint (momentum buffers only, LRs reset)")
