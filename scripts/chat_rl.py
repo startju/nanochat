@@ -22,10 +22,14 @@ import itertools
 import wandb
 import torch
 import torch.distributed as dist
+from nanoops.integration import maybe_patch_nanchat
 from nanochat.common import compute_init, compute_cleanup, print0, get_base_dir, DummyWandb, autodetect_device_type
 from nanochat.checkpoint_manager import save_checkpoint, load_model
 from nanochat.engine import Engine
 from tasks.gsm8k import GSM8K
+
+# Opt-in nanoops swap: same entry hook as base_train/chat_sft, gated by NANOOPS=1.
+maybe_patch_nanchat()
 
 # -----------------------------------------------------------------------------
 # CLI arguments
