@@ -63,3 +63,30 @@ def test_linear_module_backward_matches_torch():
     assert torch.allclose(x.grad, x2.grad, atol=1e-6)
     assert torch.allclose(mine.weight.grad, theirs.weight.grad, atol=1e-6)
     assert torch.allclose(mine.bias.grad, theirs.bias.grad, atol=1e-6)
+
+
+def test_cross_entropy_all_ignore_is_zero_loss_zero_grad():
+    x = torch.randn(4, 10, requires_grad=True)
+    target = torch.full((4,), -1, dtype=torch.long)
+
+    loss = nF.cross_entropy(x, target, ignore_index=-1, reduction="mean")
+    loss.backward()
+
+    assert torch.isfinite(loss)
+    assert loss.item() == 0.0
+    assert torch.equal(x.grad, torch.zeros_like(x))
+
+
+def test_cross_entropy_partial_ignore_matches_torch():
+    torch.manual_seed(0)
+    x = torch.randn(6, 10, requires_grad=True)
+    x_ref = x.detach().clone().requires_grad_(True)
+    target = torch.tensor([0, -1, 3, 4, -1, 2])
+
+    loss = nF.cross_entropy(x, target, ignore_index=-1, reduction="mean")
+    loss_ref = tF.cross_entropy(x_ref, target, ignore_index=-1, reduction="mean")
+    loss.backward()
+    loss_ref.backward()
+
+    assert torch.allclose(loss, loss_ref, atol=1e-6)
+    assert torch.allclose(x.grad, x_ref.grad, atol=1e-6)

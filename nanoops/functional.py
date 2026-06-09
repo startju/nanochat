@@ -1001,8 +1001,9 @@ def cross_entropy(
       ignore_index: Target value to skip. Defaults to -100 (PyTorch default);
                     nanchat passes -1 explicitly.
       reduction:    "mean" (default) / "sum" / "none". "mean" divides by the
-                    number of *non-ignored* positions, matching PyTorch
-                    (returns NaN if all positions are ignored).
+                    number of *non-ignored* positions. If all positions are
+                    ignored, returns 0 with zero gradient; PyTorch returns a
+                    NaN forward value here but still has zero logits gradient.
       dim:          Class dim. Defaults to -1 (PyTorch hardcodes class to
                     dim 1; we expose `dim` for flexibility).
 
@@ -1030,10 +1031,13 @@ def cross_entropy(
         return per_sample.sum()
     if reduction == "mean":
         # PyTorch convention: divide by N_valid (excluding ignore_index), not
-        # by total. Cast to float to avoid integer division. If everything is
-        # ignored, valid_count is 0 and we return NaN (matching PyTorch).
+        # by total. Clamp the all-ignore case to a zero-loss, zero-gradient
+        # no-op. PyTorch returns NaN forward there, but its logits gradient is
+        # zero; preserving the zero-gradient behavior without NaN is essential
+        # for packed SFT batches where a micro-batch can have no supervised
+        # tokens.
         valid_count = (target != ignore_index).sum().to(per_sample.dtype)
-        return per_sample.sum() / valid_count
+        return per_sample.sum() / valid_count.clamp_min(1)
     raise ValueError(f"unknown reduction: {reduction!r} (expected 'mean'/'sum'/'none')")
 
 
